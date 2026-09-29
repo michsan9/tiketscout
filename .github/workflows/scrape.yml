@@ -1,0 +1,24 @@
+   name: scrape-tiket
+   on:
+     schedule:
+       - cron: '0 */6 * * *'
+     workflow_dispatch:
+   jobs:
+     scrape:
+       runs-on: ubuntu-latest
+       timeout-minutes: 150
+       steps:
+         - uses: actions/checkout@v4
+         - uses: actions/setup-python@v5
+           with: { python-version: '3.12' }
+         - run: pip install playwright && playwright install --with-deps chromium
+         - run: python tiketscout.py once
+           env:
+             INGEST_URL: ${{ secrets.INGEST_URL }}
+             INGEST_KEY: ${{ secrets.INGEST_KEY }}
+         - uses: actions/upload-artifact@v4
+           if: always()
+           with:
+             name: screenshot-gagal
+             path: gagal_*.png
+             if-no-files-found: ignore
