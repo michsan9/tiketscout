@@ -46,19 +46,35 @@ FALLBACK = {("bus", "Singaraja", "Denpasar"): 100_000}
 
 # ---- URL template. Situs bus/kereta sering berubah: cek manual di browser lalu sesuaikan.
 def url_for(mode, o, d, date):
-    s = date.isoformat()
+    s = date.isoformat() if date else "*"
     if mode == "flight":
         q = quote(f"Flights from {o} to {d} on {s} one way")
         return f"https://www.google.com/travel/flights?q={q}&curr=IDR&hl=id"
     if mode == "train":
         return (f"https://www.tiket.com/kereta-api/cari?d={o}&dt=STATION&a={d}"
                 f"&at=STATION&date={s}&adult=1&infant=0")
-    if mode == "bus":
-        return (f"https://www.redbus.id/tiket-bus/{o.lower()}-ke-{d.lower()}"
-                f"?onward={date.strftime('%d-%b-%Y')}")
+    if mode == "bus":  # halaman rute redBus (memuat "Tiket Bus Termurah: RP xxx"), tidak per tanggal
+        return f"https://www.redbus.id/tiket-bus/{SLUG.get(o, o).lower()}-ke-{SLUG.get(d, d).lower()}"
+
+# Nama kota di URL redBus (Ketapang adalah titik naik di Banyuwangi)
+SLUG = {"Denpasar": "denpasar-bali", "Ketapang": "banyuwangi"}
+FROM_RE = re.compile(r"(?:mulai dari|harga mulai)\s*Rp[\s\xa0]*([\d]{1,3}(?:\.\d{3})+)", re.I)
+
+def bus_urls(o, d):
+    """Daftar sumber harga bus/travel (shuttle) berurutan; dicoba sampai ada harga."""
+    pairs = []
+    for a, b in [(SLUG.get(o, o), SLUG.get(d, d)), (o, d)]:
+        if (a.lower(), b.lower()) not in pairs: pairs.append((a.lower(), b.lower()))
+    urls = []
+    for a, b in pairs:
+        urls += [f"https://www.redbus.id/tiket-bus/{a}-ke-{b}",                      # bus + travel
+                 f"https://www.busonlineticket.co.id/id-id/tiket-bus-{a}-ke-{b}",     # bus
+                 f"https://www.traveloka.com/id-id/bus-and-shuttle/route/{a}.{b}"]    # bus + travel/shuttle
+    return urls
 
 MIN_HARGA = {"flight": 300_000, "train": 50_000, "bus": 30_000}
-PRICE_RE = re.compile(r"Rp[\s\xa0]*([\d]{1,3}(?:\.\d{3})+)")
+PRICE_RE = re.compile(r"Rp[\s\xa0]*([\d]{1,3}(?:\.\d{3})+)", re.I)
+BUS_RE = re.compile(r"Termurah\s*:?\s*Rp[\s\xa0]*([\d]{1,3}(?:\.\d{3})+)", re.I)
 
 def init_db():
     c = sqlite3.connect(DB)
@@ -73,12 +89,27 @@ def needed_legs():
         dep = TGL_MULAI + dt.timedelta(days=i)
         for legs in SKENARIO.values():
             for mode, o, d, off in legs:
-                out.add((mode, o, d, dep + dt.timedelta(days=off)))
-    return sorted(out, key=lambda x: (x[3], x[0]))
+                # bus: harga rute (tidak per tanggal) -> cukup 1 halaman per rute
+                out.add((mode, o, d, None if mode == "bus" else dep + dt.timedelta(days=off)))
+    return sorted(out, key=lambda x: (x[3] or dt.date.min, x[0]))
 
 async def scrape_leg(page, mode, o, d, date):
+    if mode == "bus":                      # bus/travel: coba beberapa sumber sampai ada harga
+        for u in bus_urls(o, d):
+            try:
+                await page.goto(u, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(4000)
+                text = await page.inner_text("body")
+            except Exception:
+                continue
+            m = BUS_RE.search(text) or FROM_RE.search(text)
+            if m and int(m.group(1).replace(".", "")) >= MIN_HARGA["bus"]:
+                print("   sumber:", u.split("/")[2], flush=True)
+                return int(m.group(1).replace(".", "")), 1
+        await page.screenshot(path=f"gagal_bus_{o}_{d}.png")
+        return None
     await page.goto(url_for(mode, o, d, date), wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(7000)  # tunggu hasil dimuat (JS)
+    await page.wait_for_timeout(7000 if mode != "bus" else 4000)  # tunggu hasil dimuat (JS)
     text = await page.inner_text("body")
     prices = [int(m.replace(".", "")) for m in PRICE_RE.findall(text)]
     prices = [p for p in prices if MIN_HARGA[mode] <= p <= 30_000_000]
@@ -105,26 +136,27 @@ async def run_once():
                                    "AppleWebKit/537.36 Chrome/124 Safari/537.36")
         page = await ctx.new_page()
         for mode, o, d, date in legs:
+            ds = date.isoformat() if date else "*"
             try:
                 r = await scrape_leg(page, mode, o, d, date)
             except Exception as e:
                 print("  ERR", mode, o, d, date, str(e)[:60]); continue
             if r:
                 db.execute("INSERT INTO prices VALUES(?,?,?,?,?,?,?)",
-                           (dt.datetime.now().isoformat(), mode, o, d, date.isoformat(), r[0], r[1]))
+                           (dt.datetime.now().isoformat(), mode, o, d, ds, r[0], r[1]))
                 db.commit()
-                batch.append(dict(mode=mode, o=o, d=d, date=date.isoformat(), price=r[0]))
+                batch.append(dict(mode=mode, o=o, d=d, date=ds, price=r[0]))
                 push(batch); batch.clear()   # kirim tiap harga -> dashboard realtime
-                print(f"  {mode:6} {o}->{d} {date}  Rp{r[0]:,}", flush=True)
+                print(f"  {mode:6} {o}->{d} {ds}  Rp{r[0]:,}", flush=True)
             else:
-                print(f"  {mode:6} {o}->{d} {date}  (tidak ada harga)")
+                print(f"  {mode:6} {o}->{d} {ds}  (tidak ada harga)", flush=True)
             await asyncio.sleep(random.uniform(3, 8))  # jeda anti-blokir
         await br.close()
     push(batch)
 
 def latest(db, mode, o, d, date):
-    r = db.execute("SELECT price FROM prices WHERE mode=? AND o=? AND d=? AND date=? "
-                   "ORDER BY ts DESC LIMIT 1", (mode, o, d, date.isoformat())).fetchone()
+    r = db.execute("SELECT price FROM prices WHERE mode=? AND o=? AND d=? AND date IN (?, '*') "
+                   "ORDER BY (date='*') ASC, ts DESC LIMIT 1", (mode, o, d, date.isoformat())).fetchone()
     return r[0] if r else None
 
 def report():
