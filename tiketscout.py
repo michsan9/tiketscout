@@ -114,8 +114,8 @@ async def run_once():
                            (dt.datetime.now().isoformat(), mode, o, d, date.isoformat(), r[0], r[1]))
                 db.commit()
                 batch.append(dict(mode=mode, o=o, d=d, date=date.isoformat(), price=r[0]))
-                if len(batch) >= 25: push(batch); batch.clear()
-                print(f"  {mode:6} {o}->{d} {date}  Rp{r[0]:,}")
+                push(batch); batch.clear()   # kirim tiap harga -> dashboard realtime
+                print(f"  {mode:6} {o}->{d} {date}  Rp{r[0]:,}", flush=True)
             else:
                 print(f"  {mode:6} {o}->{d} {date}  (tidak ada harga)")
             await asyncio.sleep(random.uniform(3, 8))  # jeda anti-blokir
