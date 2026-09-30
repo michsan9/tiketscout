@@ -110,16 +110,39 @@ def to_min(m):
     v = int(m.group(1)) * 60 + (int(m.group(2)) if m.group(2) else 0)
     return v if 20 <= v <= 3600 else None
 
+TIME_RE = re.compile(r"(?<![\d.,])(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)")            # jam tayang 12:25 / 12.25
+PROMO_RE = re.compile(r"cashback|hemat|potongan|voucher|kupon|coupon|bonus|poin|points", re.I)
+AIRLINES = ["Batik Air Malaysia", "Batik Air", "Malaysia Airlines", "Lion Air", "Super Air Jet", "Citilink",
+            "Garuda Indonesia", "Garuda", "Pelita Air", "AirAsia", "TransNusa", "Wings Air", "Scoot", "Singapore Airlines", "Sriwijaya"]
+
+def maskapai(pre, post):
+    best = None
+    for name in AIRLINES:
+        for x in re.finditer(re.escape(name), pre, re.I):
+            if best is None or x.start() > best[0] or (x.start() == best[0] and len(name) > len(best[1])):
+                best = (x.start(), name)
+    if best: return best[1]
+    for name in AIRLINES:
+        if re.search(re.escape(name), post, re.I): return name
+    return None
+
 def opsi(text, mode):
-    """Semua opsi di halaman: [(harga, durasi_menit|None)]. Durasi = yang terdekat SEBELUM harga (atau sesudahnya bila tak ada)."""
+    """Opsi VALID di halaman -> [(harga, durasi_menit|None, maskapai|None, bukti)].
+    Valid = harga berada di dalam kartu hasil (ada >=2 jam tayang di depannya) dan bukan angka promo/cashback.
+    Angka di kalender harga / banner promo (tanpa jam tayang) sengaja DIABAIKAN."""
     out = []
     for m in PRICE_RE.finditer(text):
         v = int(re.sub(r"[.,]", "", m.group(1)))
         if not (MIN_HARGA[mode] <= v <= 30_000_000): continue
-        before = [to_min(x) for x in DUR_RE.finditer(text[max(0, m.start() - 400): m.start()])]
-        after = [to_min(x) for x in DUR_RE.finditer(text[m.end(): m.end() + 120])]
-        before, after = [x for x in before if x], [x for x in after if x]
-        out.append((v, before[-1] if before else (after[0] if after else None)))
+        pre = text[max(0, m.start() - 450): m.start()]
+        post = text[m.end(): m.end() + 120]
+        if len(TIME_RE.findall(pre)) < 2: continue
+        if PROMO_RE.search(text[max(0, m.start() - 40): m.start()]): continue
+        before = [x for x in (to_min(y) for y in DUR_RE.finditer(pre[-400:])) if x]
+        after = [x for x in (to_min(y) for y in DUR_RE.finditer(post)) if x]
+        dur = before[-1] if before else (after[0] if after else None)
+        bukti = re.sub(r"\s+", " ", text[max(0, m.start() - 170): m.end() + 15]).strip()
+        out.append((v, dur, maskapai(pre, post), bukti))
     return out
 
 def bus_dur(text, m):
@@ -157,9 +180,39 @@ def train_url(site, o, d, date):
         "tiket": f"https://www.tiket.com/kereta-api/cari?d={o}&dt=STATION&a={d}&at=STATION&date={iso}&adult=1&infant=0",
     }[site]
 
-SHOTS = [0]   # batasi jumlah screenshot gagal
+SHOTS, DUMPS = [0], [0]
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+def simpan_teks(nama, text, url=""):
+    """Simpan teks halaman (untuk memperbaiki pembacaan bila OTA berubah). Diunggah sebagai artifact."""
+    if DUMPS[0] < 12 or nama.startswith("cek_"):
+        DUMPS[0] += 1
+        with open(f"teks_{nama}.txt", "w", encoding="utf-8") as f: f.write(url + "\n\n" + text[:8000])
+
+async def buka(p):
+    br = await p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+    ctx = await br.new_context(locale="id-ID", timezone_id="Asia/Jakarta", user_agent=UA, viewport={"width": 1366, "height": 900})
+    await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    return br, await ctx.new_page()
+
+async def tunggu_hasil(page, mode, maks=28):
+    """Tunggu sampai kartu hasil (harga + jam tayang) muncul; scroll agar lazy-load jalan."""
+    t0, text = time.time(), ""
+    while time.time() - t0 < maks:
+        await page.wait_for_timeout(3000)
+        try: text = await page.inner_text("body")
+        except Exception: continue
+        if opsi(text, mode):
+            await page.wait_for_timeout(5000)          # hasil OTA datang bertahap -> beri waktu opsi lain muncul
+            try: text = await page.inner_text("body")
+            except Exception: pass
+            return text
+        try: await page.mouse.wheel(0, 800)
+        except Exception: pass
+    return text
 
 async def scrape_leg(page, mode, o, d, date, site=None):
+    """Return dict(price, n, dur, airline, bukti, url, batik) atau None."""
     if mode == "bus":                      # bus/travel: coba beberapa sumber sampai ada harga
         for u in bus_urls(o, d):
             try:
@@ -172,22 +225,34 @@ async def scrape_leg(page, mode, o, d, date, site=None):
             if m and int(m.group(1).replace(".", "")) >= MIN_HARGA["bus"]:
                 dur = bus_dur(text, m)
                 print("   sumber:", u.split("/")[2], "| durasi:", f"{dur} mnt" if dur else "-", flush=True)
-                return int(m.group(1).replace(".", "")), 1, dur
+                bukti = re.sub(r"\s+", " ", text[max(0, m.start() - 60): m.end()]).strip()
+                return dict(price=int(m.group(1).replace(".", "")), n=1, dur=dur, airline=None, bukti=bukti, url=u, batik=None)
         return None
     url = flight_url(site, o, d, date) if mode == "flight" else train_url(site, o, d, date)
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(10000 if mode == "flight" else 7000)  # tunggu hasil dimuat (JS)
-    text = await page.inner_text("body")
+    text = await tunggu_hasil(page, mode)
     ops = opsi(text, mode)
     if not ops:
-        blk = " (kemungkinan diblokir/CAPTCHA)" if re.search(r"captcha|robot|access denied|verify you", text, re.I) else ""
+        blk = " (kemungkinan diblokir/CAPTCHA)" if re.search(r"captcha|robot|access denied|verify you|unusual traffic", text, re.I) else ""
         print(f"     {site or mode}: kosong{blk}", flush=True)
-        if SHOTS[0] < 20:
+        simpan_teks(f"{site or mode}_{o}_{d}_{date}", text, page.url)
+        if SHOTS[0] < 12:
             SHOTS[0] += 1
             await page.screenshot(path=f"gagal_{site or mode}_{o}_{d}_{date}.png")
         return None
     best = min(ops, key=lambda t: t[0])
-    return best[0], len(ops), best[1]      # (harga termurah, jumlah opsi, durasi opsi termurah dlm menit)
+    batik = min([x for x in ops if x[2] and "batik" in x[2].lower()], key=lambda t: t[0], default=None)
+    return dict(price=best[0], n=len(ops), dur=best[1], airline=best[2], bukti=best[3], url=page.url, batik=batik)
+
+def baris(mode, o, d, ds, site, r):
+    """Baris yang dikirim ke dashboard: opsi termurah + (bila ada) opsi Batik Air termurah."""
+    rows = [dict(mode=mode, o=o, d=d, date=ds, price=r["price"], dur=r["dur"], airline=r["airline"],
+                 bukti=r["bukti"], url=r["url"], site=site or mode)]
+    if r.get("batik"):
+        b = r["batik"]
+        rows.append(dict(mode=mode, o=o, d=d, date=ds, price=b[0], dur=b[1], airline=b[2], bukti=b[3],
+                         url=r["url"], site=f"{site}.batik"))
+    return rows
 
 def push(batch):
     """Kirim hasil scraping ke hosting (DomCloud) lewat POST JSON."""
@@ -197,30 +262,36 @@ def push(batch):
     try: print("  push ke hosting:", urllib.request.urlopen(req, timeout=60).read()[:60], flush=True)
     except Exception as e: print("  push gagal:", e, flush=True)
 
+def fmt(r):
+    return (f"Rp{r['price']:,}  " + (f"{r['dur'] // 60}j{r['dur'] % 60:02d}m" if r["dur"] else "durasi ?")
+            + (f"  {r['airline']}" if r["airline"] else ""))
+
 async def run_once():
-    db = init_db(); legs = needed_legs()
+    db = init_db(); legs = needed_legs(); gagal, jeda = {}, {}
     print(f"[{dt.datetime.now():%H:%M}] scraping {len(legs)} leg-tanggal...", flush=True)
     async with async_playwright() as p:
-        br = await p.chromium.launch(headless=HEADLESS)
-        ctx = await br.new_context(locale="id-ID", timezone_id="Asia/Jakarta",
-                                   user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                   "AppleWebKit/537.36 Chrome/124 Safari/537.36")
-        page = await ctx.new_page()
+        br, page = await buka(p)
         for mode, o, d, date in legs:
             ds = date.isoformat() if date else "*"
             for site in (FLIGHT_SITES if mode == "flight" else TRAIN_SITES if mode == "train" else [None]):
+                if site and time.time() < jeda.get(site, 0): continue        # situs sedang dijeda (gagal berturut-turut)
                 try:
                     r = await scrape_leg(page, mode, o, d, date, site)
                 except Exception as e:
-                    print("  ERR", site or mode, o, d, ds, str(e)[:60], flush=True); continue
+                    print("  ERR", site or mode, o, d, ds, str(e)[:60], flush=True); r = None
                 if r:
+                    gagal[site] = 0
                     db.execute("INSERT INTO prices VALUES(?,?,?,?,?,?,?)",
-                               (dt.datetime.now().isoformat(), mode, o, d, ds, r[0], r[1]))
+                               (dt.datetime.now().isoformat(), mode, o, d, ds, r["price"], r["n"]))
                     db.commit()
-                    push([dict(mode=mode, o=o, d=d, date=ds, price=r[0], dur=r[2], site=site or mode)])
-                    print(f"  {mode:6} {(site or ''):9} {o}->{d} {ds}  Rp{r[0]:,}  " + (f"{r[2] // 60}j{r[2] % 60:02d}m" if r[2] else "durasi ?"), flush=True)
-                elif mode == "bus":
-                    print(f"  {mode:6} {o}->{d} {ds}  (tidak ada harga)", flush=True)
+                    push(baris(mode, o, d, ds, site, r))
+                    print(f"  {mode:6} {(site or ''):9} {o}->{d} {ds}  {fmt(r)}", flush=True)
+                else:
+                    gagal[site] = gagal.get(site, 0) + 1
+                    if mode == "bus": print(f"  {mode:6} {o}->{d} {ds}  (tidak ada harga)", flush=True)
+                    if site and gagal[site] >= 8:
+                        jeda[site] = time.time() + 1800; gagal[site] = 0
+                        print(f"  !! {site} gagal 8x berturut-turut -> dijeda 30 menit", flush=True)
                 await asyncio.sleep(random.uniform(2, 5))  # jeda anti-blokir
         await br.close()
 
@@ -229,17 +300,20 @@ async def cek(mode, o, d, ds):
     date = None if mode == "bus" else dt.date.fromisoformat(ds)
     sites = FLIGHT_SITES if mode == "flight" else TRAIN_SITES if mode == "train" else [None]
     async with async_playwright() as p:
-        br = await p.chromium.launch(headless=HEADLESS)
-        ctx = await br.new_context(locale="id-ID", timezone_id="Asia/Jakarta",
-                                   user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36")
-        page = await ctx.new_page()
+        br, page = await buka(p)
         for site in sites:
             try: r = await scrape_leg(page, mode, o, d, date, site)
             except Exception as e: r = None; print("  ERR", site, str(e)[:80], flush=True)
-            print(f"CEK {mode} {o}->{d} {ds} [{site or 'bus'}]: " + (f"Rp{r[0]:,} | " + (f"{r[2] // 60}j{r[2] % 60:02d}m" if r[2] else "durasi ?") if r else "KOSONG"), flush=True)
-            try: await page.screenshot(path=f"cek_{mode}_{site or 'bus'}.png")
+            print(f"CEK {mode} {o}->{d} {ds} [{site or 'bus'}]: " + (fmt(r) if r else "KOSONG"), flush=True)
+            try:
+                text = await page.inner_text("body")
+                simpan_teks(f"cek_{mode}_{site or 'bus'}", text, page.url)
+                await page.screenshot(path=f"cek_{mode}_{site or 'bus'}.png")
+                if mode != "bus":
+                    for x in sorted(opsi(text, mode))[:5]:
+                        print(f"      opsi: Rp{x[0]:,} | {x[1] or '?'} mnt | {x[2] or '-'} | {x[3][:90]}", flush=True)
             except Exception: pass
-            if r: push([dict(mode=mode, o=o, d=d, date=ds if date else "*", price=r[0], dur=r[2], site=site or mode)])
+            if r: push(baris(mode, o, d, ds if date else "*", site, r))
         await br.close()
 
 def latest(db, mode, o, d, date):
