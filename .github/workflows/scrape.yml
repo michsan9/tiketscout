@@ -1,24 +1,47 @@
-   name: scrape-tiket
-   on:
-     schedule:
-       - cron: '0 */6 * * *'
-     workflow_dispatch:
-   jobs:
-     scrape:
-       runs-on: ubuntu-latest
-       timeout-minutes: 300
-       steps:
-         - uses: actions/checkout@v4
-         - uses: actions/setup-python@v5
-           with: { python-version: '3.12' }
-         - run: pip install playwright && playwright install --with-deps chromium
-         - run: python -u tiketscout.py once
-           env:
-             INGEST_URL: ${{ secrets.INGEST_URL }}
-             INGEST_KEY: ${{ secrets.INGEST_KEY }}
-         - uses: actions/upload-artifact@v4
-           if: always()
-           with:
-             name: screenshot-gagal
-             path: gagal_*.png
-             if-no-files-found: ignore
+# Simpan sebagai: .github/workflows/scrape.yml
+name: scrape-tiket
+on:
+  schedule:
+    - cron: '0 */3 * * *'          # tiap 3 jam (waktu UTC)
+  workflow_dispatch:
+    inputs:
+      cek:
+        description: 'Uji cepat 1 rute (kosongkan untuk scraping penuh). Contoh: flight DPS PKU 2027-03-01 | train KTG PSE 2027-03-01 | bus Singaraja Surabaya 2027-03-01'
+        required: false
+        default: ''
+concurrency:
+  group: scrape-tiket              # tidak boleh dua run bersamaan; run berikutnya antre
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 175
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install playwright && playwright install --with-deps chromium
+      - name: Scraping
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_KEY: ${{ secrets.INGEST_KEY }}
+          CEK: ${{ github.event.inputs.cek }}
+        run: |
+          if [ -n "$CEK" ]; then python -u tiketscout.py cek $CEK; else python -u tiketscout.py once; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot
+          path: |
+            gagal_*.png
+            cek_*.png
+          if-no-files-found: ignore
+      - name: Jaga jadwal tetap aktif (GitHub menonaktifkan cron repo publik setelah 60 hari tanpa aktivitas)
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable scrape.yml --repo ${{ github.repository }}
