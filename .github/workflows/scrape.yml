@@ -38,6 +38,7 @@ jobs:
           path: |
             gagal_*.png
             cek_*.png
+            teks_*.txt
           if-no-files-found: ignore
       - name: Jaga jadwal tetap aktif (GitHub menonaktifkan cron repo publik setelah 60 hari tanpa aktivitas)
         if: always()
