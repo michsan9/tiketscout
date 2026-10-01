@@ -129,6 +129,17 @@ def maskapai(pre, post):
         if re.search(re.escape(name), post, re.I): return name
     return None
 
+# Panel filter / bilah urut OTA (slider jam & durasi, 'Harga per orang', dst) BUKAN kartu hasil. Teks sebelum penanda ini dibuang.
+FILTER_RE = re.compile(r"waktu (?:kedatangan|keberangkatan)|durasi (?:transit|perjalanan)|kota transit|harga per orang|hingga usd|rentang harga|disarankan"
+                       r"|\d{1,2}[:.]\d{2}\s*[\u2013-]\s*\d{1,2}[:.]\d{2}|\d+j(?:\s*\d+m)?\s*[\u2013-]\s*\d+j", re.I)
+BOT_RE = re.compile(r"human verification|confirm you are human|verifikasi keamanan|security check|captcha|are you a robot|just a moment|tunggu sebentar|access denied|unusual traffic|cloudflare", re.I)
+USD_RE = re.compile(r"USD[\s\xa0]*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)")
+KURS_USD = float(os.environ.get("KURS_USD_IDR") or 0)      # opsional, diisi SENDIRI (Agoda kadang menampilkan USD)
+
+def konversi_usd(text):
+    if not KURS_USD: return text
+    return USD_RE.sub(lambda m: "Rp" + f"{int(float(m.group(1).replace(',', '')) * KURS_USD):,}".replace(",", ".") + "~kurs", text)
+
 STOPS_RE = re.compile(r"langsung|non-?stop|direct|\d+\s*(?:transit|stops?)", re.I)
 BANNER_RE = re.compile(r"turun|di ?bawah|notifikasi|mengabari|penawaran|alert|below|cashback|hemat|potongan|voucher|kupon|coupon|bonus|poin|points", re.I)
 
@@ -137,10 +148,13 @@ def opsi(text, mode):
     Hanya KARTU HASIL: di depan harga (sejak harga sebelumnya) ada >=2 jam tayang. Banner promo/notifikasi diabaikan.
     Durasi total = durasi yang tepat diikuti 'Langsung / N transit / N stop' (BUKAN lama singgah/segmen);
     bila tidak ada, durasi terpanjang di kartu itu."""
+    text = konversi_usd(text)
     out, prev_end, last_end = [], 0, -999
     for m in PRICE_RE.finditer(text):
         v = int(re.sub(r"[.,]", "", m.group(1)))
         pre = text[max(prev_end, m.start() - 450): m.start()]
+        fm = list(FILTER_RE.finditer(pre))
+        if fm: pre = pre[fm[-1].end():]                    # buang panel filter/slider di depan kartu
         post = text[m.end(): m.end() + 120]
         prev_end = m.end()
         if not (MIN_HARGA[mode] <= v <= 30_000_000): continue
@@ -191,7 +205,7 @@ def flight_url(site, o, d, date):
     return {
         "traveloka": f"https://www.traveloka.com/id-id/flight/fullsearch?ap={o}.{d}&dt={dmy}.null&ps=1.0.0&sc=ECONOMY",
         "agoda": (f"https://www.agoda.com/id-id/flights/results?departureFrom={o}&departureFromType=1&arrivalTo={d}"
-                  f"&arrivalToType=1&departDate={iso}&adults=1&children=0&infants=0&cabinType=Economy&tripType=OneWay"),
+                  f"&arrivalToType=1&departDate={iso}&adults=1&children=0&infants=0&cabinType=Economy&tripType=OneWay&currencyCode=IDR&currency=IDR"),
         "trip": trip_url(o, d, date),
         "airasia": (f"https://www.airasia.com/flights/search/?origin={o}&destination={d}&departDate={dmy2}"
                     "&tripType=O&adult=1&child=0&infant=0&locale=id-id&currency=IDR"),
@@ -217,7 +231,7 @@ def simpan_teks(nama, text, url=""):
         with open(f"teks_{nama}.txt", "w", encoding="utf-8") as f: f.write(url + "\n\n" + text[:8000])
 
 async def peluncur(p):
-    args = ["--disable-blink-features=AutomationControlled"]
+    args = []
     if os.environ.get("BROWSER_CHANNEL", "chrome") != "chromium":       # Chrome sudah terpasang di runner GitHub
         try:
             br = await p.chromium.launch(channel="chrome", headless=True, args=args)
@@ -228,7 +242,6 @@ async def peluncur(p):
 
 async def konteks(br):
     ctx = await br.new_context(locale="id-ID", timezone_id="Asia/Jakarta", user_agent=UA, viewport={"width": 1366, "height": 900})
-    await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
     return ctx
 
 DIAG_N, CEK_MODE, MAKS_TUNGGU = [0], [False], [28]
@@ -254,6 +267,7 @@ async def tunggu_hasil(page, mode, maks=None):
         await page.wait_for_timeout(3000)
         try: text = await page.inner_text("body")
         except Exception: continue
+        if len(text) < 2500 and BOT_RE.search(text): return text      # halaman verifikasi anti-bot
         if opsi(text, mode):
             await page.wait_for_timeout(5000)          # hasil OTA datang bertahap -> beri waktu opsi lain muncul
             try: text = await page.inner_text("body")
@@ -283,6 +297,10 @@ async def scrape_leg(page, mode, o, d, date, site=None):
     url = flight_url(site, o, d, date) if mode == "flight" else train_url(site, o, d, date)
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     text = await tunggu_hasil(page, mode)
+    if len(text) < 2500 and BOT_RE.search(text):
+        print(f"     {site or mode}: DIBLOKIR halaman verifikasi anti-bot -> situs dilewati 6 jam (tidak dicoba ditembus)", flush=True)
+        JEDA[site] = time.time() + 6 * 3600
+        return None
     ops = opsi(text, mode)
     if not ops:
         blk = " (kemungkinan diblokir/CAPTCHA)" if re.search(r"captcha|robot|access denied|verify you|unusual traffic", text, re.I) else ""
