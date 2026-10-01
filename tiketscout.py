@@ -133,25 +133,33 @@ STOPS_RE = re.compile(r"langsung|non-?stop|direct|\d+\s*(?:transit|stops?)", re.
 BANNER_RE = re.compile(r"turun|di ?bawah|notifikasi|mengabari|penawaran|alert|below|cashback|hemat|potongan|voucher|kupon|coupon|bonus|poin|points", re.I)
 
 def opsi(text, mode):
-    """Hasil pencarian OTA -> [(harga, durasi_menit|None, maskapai|None, bukti)].
-    Hanya KARTU HASIL yang dihitung: di depan harga ada >=2 jam tayang DAN (durasi atau 'Langsung/N transit').
-    Diabaikan: kalender harga, banner promo, dan banner 'harga turun di bawah Rp...' (notifikasi harga)."""
-    out = []
+    """Hasil pencarian OTA -> [(harga, durasi_menit|None, maskapai|None, bukti, transit|None)].
+    Hanya KARTU HASIL: di depan harga (sejak harga sebelumnya) ada >=2 jam tayang. Banner promo/notifikasi diabaikan.
+    Durasi total = durasi yang tepat diikuti 'Langsung / N transit / N stop' (BUKAN lama singgah/segmen);
+    bila tidak ada, durasi terpanjang di kartu itu."""
+    out, prev_end, last_end = [], 0, -999
     for m in PRICE_RE.finditer(text):
         v = int(re.sub(r"[.,]", "", m.group(1)))
-        if not (MIN_HARGA[mode] <= v <= 30_000_000): continue
-        pre = text[max(0, m.start() - 450): m.start()]
+        pre = text[max(prev_end, m.start() - 450): m.start()]
         post = text[m.end(): m.end() + 120]
-        if len(TIME_RE.findall(pre)) < 2: continue
-        if BANNER_RE.search(text[max(0, m.start() - 90): m.start()]): continue
-        before = [x for x in (to_min(y) for y in DUR_RE.finditer(pre[-400:])) if x]
-        if not before and not STOPS_RE.search(pre[-300:]): continue
-        after = [x for x in (to_min(y) for y in DUR_RE.finditer(post)) if x]
-        dur = before[-1] if before else (after[0] if after else None)
+        prev_end = m.end()
+        if not (MIN_HARGA[mode] <= v <= 30_000_000): continue
+        banner = BANNER_RE.search(text[max(0, m.start() - 90): m.start()])
+        times = list(TIME_RE.finditer(pre))
+        if len(times) < 2:
+            # harga ke-2 pada kartu yang sama (harga coret/diskon): pakai yang terendah
+            if out and not banner and m.start() - last_end <= 60 and v < out[-1][0]:
+                out[-1] = (v,) + out[-1][1:]; last_end = m.end()
+            continue
+        if banner: continue
+        durs = [(y.end(), to_min(y)) for y in DUR_RE.finditer(pre) if y.start() >= times[0].start() and to_min(y)]
+        adj = [d for e, d in durs if STOPS_RE.match(pre[e:e + 16].lstrip())]
+        dur = adj[-1] if adj else (max(d for e, d in durs) if durs else None)
+        if dur is None and not STOPS_RE.search(pre): continue
+        sm = list(STOPS_RE.finditer(pre))
+        stop = sm[-1].group(0).strip().capitalize() if sm else None
         bukti = re.sub(r"\s+", " ", text[max(0, m.start() - 170): m.end() + 15]).strip()
-        sm = list(STOPS_RE.finditer(pre[-300:]))
-        stop = sm[-1].group(0).strip().capitalize() if sm else None          # 'Langsung' / '1 transit'
-        out.append((v, dur, maskapai(pre, post), bukti, stop))
+        out.append((v, dur, maskapai(pre, post), bukti, stop)); last_end = m.end()
     if len(out) >= 5:                                   # buang harga yang jauh di bawah median halaman (salah baca)
         med = sorted(x[0] for x in out)[len(out) // 2]
         out = [x for x in out if x[0] >= 0.35 * med]
@@ -209,15 +217,38 @@ def simpan_teks(nama, text, url=""):
         with open(f"teks_{nama}.txt", "w", encoding="utf-8") as f: f.write(url + "\n\n" + text[:8000])
 
 async def peluncur(p):
-    return await p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+    args = ["--disable-blink-features=AutomationControlled"]
+    if os.environ.get("BROWSER_CHANNEL", "chrome") != "chromium":       # Chrome sudah terpasang di runner GitHub
+        try:
+            br = await p.chromium.launch(channel="chrome", headless=True, args=args)
+            print("browser: Google Chrome", flush=True); return br
+        except Exception as e:
+            print("Chrome tidak tersedia, pakai Chromium:", str(e)[:70], flush=True)
+    return await p.chromium.launch(headless=HEADLESS, args=args)
 
 async def konteks(br):
     ctx = await br.new_context(locale="id-ID", timezone_id="Asia/Jakarta", user_agent=UA, viewport={"width": 1366, "height": 900})
     await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
     return ctx
 
-async def tunggu_hasil(page, mode, maks=28):
+DIAG_N, CEK_MODE, MAKS_TUNGGU = [0], [False], [28]
+
+async def diagnosa(page, text, site):
+    """Cetak ringkasan halaman yang kosong ke LOG (agar bisa langsung ditempel, tanpa unduh artifact)."""
+    if DIAG_N[0] >= 8 and not CEK_MODE[0]: return
+    DIAG_N[0] += 1
+    try: judul = await page.title()
+    except Exception: judul = "?"
+    awal = re.sub(r"\s+", " ", text[:500])
+    m = PRICE_RE.search(text)
+    sekitar = re.sub(r"\s+", " ", text[max(0, m.start() - 250): m.end() + 60]) if m else "(tidak ada angka Rp/IDR)"
+    print(f"     [diag {site}] url={page.url[:150]} | judul={judul[:80]!r} | teks={len(text)} huruf | harga={len(PRICE_RE.findall(text))} | jam={len(TIME_RE.findall(text))}", flush=True)
+    print(f"     [diag {site}] awal teks: {awal}", flush=True)
+    print(f"     [diag {site}] sekitar harga pertama: {sekitar}", flush=True)
+
+async def tunggu_hasil(page, mode, maks=None):
     """Tunggu sampai kartu hasil (harga + jam tayang) muncul; scroll agar lazy-load jalan."""
+    maks = maks or MAKS_TUNGGU[0]
     t0, text = time.time(), ""
     while time.time() - t0 < maks:
         await page.wait_for_timeout(3000)
@@ -247,7 +278,7 @@ async def scrape_leg(page, mode, o, d, date, site=None):
                 dur = bus_dur(text, m)
                 print("   sumber:", u.split("/")[2], "| durasi:", f"{dur} mnt" if dur else "-", flush=True)
                 bukti = re.sub(r"\s+", " ", text[max(0, m.start() - 60): m.end()]).strip()
-                return dict(price=int(m.group(1).replace(".", "")), n=1, dur=dur, airline=None, bukti=bukti, url=u, batik=None, cepat=None, stops=None)
+                return dict(price=int(m.group(1).replace(".", "")), n=1, dur=dur, airline=None, bukti=bukti, url=u, batik=None, cepat=None, stops=None, ops=[])
         return None
     url = flight_url(site, o, d, date) if mode == "flight" else train_url(site, o, d, date)
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -256,6 +287,7 @@ async def scrape_leg(page, mode, o, d, date, site=None):
     if not ops:
         blk = " (kemungkinan diblokir/CAPTCHA)" if re.search(r"captcha|robot|access denied|verify you|unusual traffic", text, re.I) else ""
         print(f"     {site or mode}: kosong{blk}", flush=True)
+        await diagnosa(page, text, site or mode)
         simpan_teks(f"{site or mode}_{o}_{d}_{date}", text, page.url)
         if SHOTS[0] < 12:
             SHOTS[0] += 1
@@ -264,7 +296,7 @@ async def scrape_leg(page, mode, o, d, date, site=None):
     best = min(ops, key=lambda t: t[0])
     batik = min([x for x in ops if x[2] and "batik" in x[2].lower()], key=lambda t: t[0], default=None)
     cepat = min([x for x in ops if x[1]], key=lambda t: (t[1], t[0]), default=None)   # opsi dengan durasi terpendek
-    return dict(price=best[0], n=len(ops), dur=best[1], airline=best[2], bukti=best[3], url=page.url, batik=batik, cepat=cepat, stops=best[4])
+    return dict(price=best[0], n=len(ops), dur=best[1], airline=best[2], bukti=best[3], url=page.url, batik=batik, cepat=cepat, stops=best[4], ops=ops)
 
 def baris(mode, o, d, ds, site, r):
     """Baris ke dashboard: opsi TERMURAH + opsi TERCEPAT + (bila ada) opsi Batik Air termurah."""
@@ -364,6 +396,7 @@ async def run_once():
 
 async def cek(mode, o, d, ds):
     """Uji cepat satu rute di semua sumber:  python tiketscout.py cek flight DPS PKU 2027-03-01"""
+    CEK_MODE[0] = True; MAKS_TUNGGU[0] = 45
     date = None if mode == "bus" else dt.date.fromisoformat(ds)
     sites = FLIGHT_SITES if mode == "flight" else TRAIN_SITES if mode == "train" else [None]
     async with async_playwright() as p:
@@ -372,15 +405,15 @@ async def cek(mode, o, d, ds):
             try: r = await scrape_leg(page, mode, o, d, date, site)
             except Exception as e: r = None; print("  ERR", site, str(e)[:80], flush=True)
             print(f"CEK {mode} {o}->{d} {ds} [{site or 'bus'}]: " + (fmt(r) if r else "KOSONG"), flush=True)
+            if r:
+                print(f"      termurah, teks kartu: {r['bukti']}", flush=True)
+                for x in sorted(r["ops"])[:5]:
+                    print(f"      opsi: Rp{x[0]:,} | {x[1] or '?'} mnt | {x[2] or '-'} | {x[4] or '-'}", flush=True)
+                push(baris(mode, o, d, ds if date else "*", site, r))
             try:
-                text = await page.inner_text("body")
-                simpan_teks(f"cek_{mode}_{site or 'bus'}", text, page.url)
+                simpan_teks(f"cek_{mode}_{site or 'bus'}", await page.inner_text("body"), page.url)
                 await page.screenshot(path=f"cek_{mode}_{site or 'bus'}.png")
-                if mode != "bus":
-                    for x in sorted(opsi(text, mode))[:5]:
-                        print(f"      opsi: Rp{x[0]:,} | {x[1] or '?'} mnt | {x[2] or '-'} | {x[3][:90]}", flush=True)
             except Exception: pass
-            if r: push(baris(mode, o, d, ds if date else "*", site, r))
         await br.close()
 
 def latest(db, mode, o, d, date):
