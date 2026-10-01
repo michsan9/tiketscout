@@ -5,9 +5,10 @@ Install:
     pip install playwright && playwright install chromium
 
 Pakai:
-    python tiketscout.py once      # scrape sekali seluruh rentang tanggal
+    python tiketscout.py once      # cari harga SEMUA tanggal (1-31 Maret 2027), pergi & pulang, semua skenario
     python tiketscout.py watch     # scrape terus-menerus tiap INTERVAL_JAM
     python tiketscout.py report    # bandingkan skenario dari data terakhir di DB
+    python tiketscout.py cek flight DPS PKU 2027-03-01   # uji 1 rute di semua OTA
 
 Catatan: 1 Syawal 1448 H diperkirakan ~9-10 Maret 2027 (cek sidang isbat).
 """
@@ -18,35 +19,37 @@ from playwright.async_api import async_playwright
 DB = "tiket.db"
 INGEST_URL = os.environ.get("INGEST_URL")   # https://domain/index.php?a=ingest
 INGEST_KEY = os.environ.get("INGEST_KEY")
-# Idul Fitri 2027 diperkirakan 9-10 Maret. PERGI = mudik, BALIK = arus balik (pulang).
-PERGI = (dt.date(2027, 2, 22), dt.date(2027, 3, 8))
-BALIK = (dt.date(2027, 3, 12), dt.date(2027, 3, 28))
-STEP_HARI = 2                          # ambil tiap N hari (hemat waktu scraping)
-TGL_MULAI, TGL_AKHIR = PERGI          # dipakai report() sekali jalan
+# Pencarian per tanggal: 1-31 Maret 2027 (Idul Fitri diperkirakan 9-10 Maret). Pergi DAN pulang dicari di setiap tanggal.
+TGL_MULAI = dt.date(2027, 3, 1)
+TGL_AKHIR = dt.date(2027, 3, 31)
+STEP_HARI = 1
+WORKERS = int(os.environ.get("WORKERS", "4"))   # jumlah halaman browser paralel
+K_VERIFIKASI = 3                                # per rute: K tanggal termurah dicek ulang di OTA lain
 INTERVAL_JAM = 3
 HEADLESS = True
 
-# ---- Definisi skenario: tiap leg = (moda, asal, tujuan, offset_hari dari tgl berangkat)
-# Offset ke leg berikutnya perlu disesuaikan dengan jam tiba (bus/kereta malam = +1).
+# ---- Skenario: Anda tinggal di SINGARAJA (tanpa bandara komersial) -> darat dulu ke gerbang, lalu terbang.
+#   Gerbang 1: DENPASAR (DPS) naik travel/bus ~3 jam.   Gerbang 2: SURABAYA (SUB) naik bus ~10 jam.
+#   Tidak ada penerbangan langsung DPS-PKU: transit via Jakarta (CGK), Kuala Lumpur (KUL) atau Singapura (SIN) tidak masalah.
+#   "Tiket tunggal" = OTA yang memilihkan transit-nya; "via X" = dua tiket terpisah (cek harga tiap sektor).
+# Tiap leg = (moda, asal, tujuan, offset_hari dari tanggal berangkat). Pulang = urutan dibalik otomatis (balik()).
 SKENARIO = {
-    "1. Bus>DPS + Pesawat DPS-PKU": [
+    "A. Travel ke Denpasar + DPS-PKU (tiket tunggal, transit bebas)": [
         ("bus", "Singaraja", "Denpasar", 0), ("flight", "DPS", "PKU", 0)],
-    "2. Bus>Ketapang + KA>Pasarsenen + Pesawat CGK-PKU": [
-        ("bus", "Singaraja", "Ketapang", 0), ("train", "KTG", "PSE", 0), ("flight", "CGK", "PKU", 1)],
-    "3. Bus>Surabaya + Pesawat SUB-PKU": [
-        ("bus", "Singaraja", "Surabaya", 0), ("flight", "SUB", "PKU", 1)],
-    "4. Bus>Jakarta + Pesawat CGK-PKU": [
-        ("bus", "Singaraja", "Jakarta", 0), ("flight", "CGK", "PKU", 2)],
-    # --- skenario tambahan ---
-    "5. Bus>DPS + Pesawat DPS-CGK + CGK-PKU (tiket terpisah)": [
+    "B. Travel ke Denpasar + via Jakarta (DPS-CGK + CGK-PKU)": [
         ("bus", "Singaraja", "Denpasar", 0), ("flight", "DPS", "CGK", 0), ("flight", "CGK", "PKU", 0)],
-    "6. Bus>DPS + Pesawat DPS-SUB + SUB-PKU (tiket terpisah)": [
-        ("bus", "Singaraja", "Denpasar", 0), ("flight", "DPS", "SUB", 0), ("flight", "SUB", "PKU", 0)],
+    "C. Travel ke Denpasar + via Kuala Lumpur (DPS-KUL + KUL-PKU)": [
+        ("bus", "Singaraja", "Denpasar", 0), ("flight", "DPS", "KUL", 0), ("flight", "KUL", "PKU", 0)],
+    "D. Travel ke Denpasar + via Singapura (DPS-SIN + SIN-PKU)": [
+        ("bus", "Singaraja", "Denpasar", 0), ("flight", "DPS", "SIN", 0), ("flight", "SIN", "PKU", 0)],
+    "E. Bus ke Surabaya + SUB-PKU (tiket tunggal, transit bebas)": [
+        ("bus", "Singaraja", "Surabaya", 0), ("flight", "SUB", "PKU", 1)],
+    "F. Bus ke Surabaya + via Jakarta (SUB-CGK + CGK-PKU)": [
+        ("bus", "Singaraja", "Surabaya", 0), ("flight", "SUB", "CGK", 1), ("flight", "CGK", "PKU", 1)],
 }
 
-# Estimasi jika scraping leg gagal (Rp) - ditandai '*' di laporan. Ubah sesuai kenyataan.
-FALLBACK = {("bus", "Singaraja", "Denpasar"): 100_000,
-            ("train", "KTG", "PSE"): 505_000}   # tarif KA Blambangan Ekspres ekonomi (KAI, 2024)
+# Hanya tarif resmi yang sudah ada sumbernya. Leg lain TANPA harga = skenario ditandai belum lengkap (isi manual di dashboard).
+FALLBACK = {("train", "KTG", "PSE"): 505_000}   # tarif KA Blambangan Ekspres ekonomi (KAI, 2024)
 
 # ---- URL template. Situs bus/kereta sering berubah: cek manual di browser lalu sesuaikan.
 def url_for(mode, o, d, date):
@@ -61,7 +64,7 @@ def url_for(mode, o, d, date):
         return f"https://www.redbus.id/tiket-bus/{SLUG.get(o, o).lower()}-ke-{SLUG.get(d, d).lower()}"
 
 # Nama kota di URL redBus (Ketapang adalah titik naik di Banyuwangi)
-SLUG = {"Denpasar": "denpasar-bali", "Ketapang": "banyuwangi"}
+SLUG = {"Denpasar": "denpasar-bali"}
 FROM_RE = re.compile(r"(?:mulai dari|harga mulai)\s*Rp[\s\xa0]*([\d]{1,3}(?:\.\d{3})+)", re.I)
 
 def bus_urls(o, d):
@@ -93,11 +96,11 @@ def balik(legs):
 
 def needed_legs():
     out = set()
-    for (a, b), rev in ((PERGI, False), (BALIK, True)):
-        for i in range(0, (b - a).days + 1, STEP_HARI):
-            dep = a + dt.timedelta(days=i)
-            for legs in SKENARIO.values():
-                for mode, o, d, off in (balik(legs) if rev else legs):
+    for i in range(0, (TGL_AKHIR - TGL_MULAI).days + 1, STEP_HARI):
+        dep = TGL_MULAI + dt.timedelta(days=i)
+        for legs in SKENARIO.values():
+            for rute in (legs, balik(legs)):                       # pergi & pulang
+                for mode, o, d, off in rute:
                     # bus: harga rute (tidak per tanggal) -> cukup 1 halaman per rute
                     out.add((mode, o, d, None if mode == "bus" else dep + dt.timedelta(days=off)))
     return sorted(out, key=lambda x: (0 if x[0] == "flight" and {x[1], x[2]} == {"DPS", "PKU"} else 1, x[3] or dt.date.min, x[0]))
@@ -126,10 +129,13 @@ def maskapai(pre, post):
         if re.search(re.escape(name), post, re.I): return name
     return None
 
+STOPS_RE = re.compile(r"langsung|non-?stop|direct|\d+\s*(?:transit|stops?)", re.I)
+BANNER_RE = re.compile(r"turun|di ?bawah|notifikasi|mengabari|penawaran|alert|below|cashback|hemat|potongan|voucher|kupon|coupon|bonus|poin|points", re.I)
+
 def opsi(text, mode):
-    """Opsi VALID di halaman -> [(harga, durasi_menit|None, maskapai|None, bukti)].
-    Valid = harga berada di dalam kartu hasil (ada >=2 jam tayang di depannya) dan bukan angka promo/cashback.
-    Angka di kalender harga / banner promo (tanpa jam tayang) sengaja DIABAIKAN."""
+    """Hasil pencarian OTA -> [(harga, durasi_menit|None, maskapai|None, bukti)].
+    Hanya KARTU HASIL yang dihitung: di depan harga ada >=2 jam tayang DAN (durasi atau 'Langsung/N transit').
+    Diabaikan: kalender harga, banner promo, dan banner 'harga turun di bawah Rp...' (notifikasi harga)."""
     out = []
     for m in PRICE_RE.finditer(text):
         v = int(re.sub(r"[.,]", "", m.group(1)))
@@ -137,12 +143,18 @@ def opsi(text, mode):
         pre = text[max(0, m.start() - 450): m.start()]
         post = text[m.end(): m.end() + 120]
         if len(TIME_RE.findall(pre)) < 2: continue
-        if PROMO_RE.search(text[max(0, m.start() - 40): m.start()]): continue
+        if BANNER_RE.search(text[max(0, m.start() - 90): m.start()]): continue
         before = [x for x in (to_min(y) for y in DUR_RE.finditer(pre[-400:])) if x]
+        if not before and not STOPS_RE.search(pre[-300:]): continue
         after = [x for x in (to_min(y) for y in DUR_RE.finditer(post)) if x]
         dur = before[-1] if before else (after[0] if after else None)
         bukti = re.sub(r"\s+", " ", text[max(0, m.start() - 170): m.end() + 15]).strip()
-        out.append((v, dur, maskapai(pre, post), bukti))
+        sm = list(STOPS_RE.finditer(pre[-300:]))
+        stop = sm[-1].group(0).strip().capitalize() if sm else None          # 'Langsung' / '1 transit'
+        out.append((v, dur, maskapai(pre, post), bukti, stop))
+    if len(out) >= 5:                                   # buang harga yang jauh di bawah median halaman (salah baca)
+        med = sorted(x[0] for x in out)[len(out) // 2]
+        out = [x for x in out if x[0] >= 0.35 * med]
     return out
 
 def bus_dur(text, m):
@@ -156,7 +168,14 @@ def bus_dur(text, m):
     return None
 
 # ---- Pesawat: dicari langsung di tiap OTA/maskapai (URL bisa berubah -> sesuaikan bila kosong) ----
-FLIGHT_SITES = ["traveloka", "agoda", "trip", "airasia"]   # tambahkan "google" bila ingin Google Flights juga
+FLIGHT_SITES = ["trip", "traveloka", "agoda", "airasia"]   # urutan: Trip.com dulu; OTA berikutnya dipakai bila yang sebelumnya kosong
+TRIP_ID = {"DPS": 723, "PKU": 5604}                        # id kota Trip.com yang sudah diketahui (dari URL contoh)
+
+def trip_url(o, d, date):
+    u = f"https://id.trip.com/flights/showfarefirst?dcity={o.lower()}&acity={d.lower()}&ddate={date.isoformat()}"
+    if o in TRIP_ID: u += f"&dcityid={TRIP_ID[o]}"
+    if d in TRIP_ID: u += f"&acityid={TRIP_ID[d]}"
+    return u + "&triptype=ow&class=y&lowpricesource=searchform&quantity=1&searchboxarg=t&nonstoponly=off&locale=id-ID&curr=IDR"
 # batikair.com: pencarian berupa form tanpa deep link -> harga Batik Air diisi manual di dashboard.
 
 def flight_url(site, o, d, date):
@@ -165,7 +184,7 @@ def flight_url(site, o, d, date):
         "traveloka": f"https://www.traveloka.com/id-id/flight/fullsearch?ap={o}.{d}&dt={dmy}.null&ps=1.0.0&sc=ECONOMY",
         "agoda": (f"https://www.agoda.com/id-id/flights/results?departureFrom={o}&departureFromType=1&arrivalTo={d}"
                   f"&arrivalToType=1&departDate={iso}&adults=1&children=0&infants=0&cabinType=Economy&tripType=OneWay"),
-        "trip": f"https://id.trip.com/flights/showfarefirst?dcity={o.lower()}&acity={d.lower()}&ddate={iso}&triptype=ow&class=y&quantity=1",
+        "trip": trip_url(o, d, date),
         "airasia": (f"https://www.airasia.com/flights/search/?origin={o}&destination={d}&departDate={dmy2}"
                     "&tripType=O&adult=1&child=0&infant=0&locale=id-id&currency=IDR"),
         "google": url_for("flight", o, d, date),
@@ -189,11 +208,13 @@ def simpan_teks(nama, text, url=""):
         DUMPS[0] += 1
         with open(f"teks_{nama}.txt", "w", encoding="utf-8") as f: f.write(url + "\n\n" + text[:8000])
 
-async def buka(p):
-    br = await p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+async def peluncur(p):
+    return await p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+
+async def konteks(br):
     ctx = await br.new_context(locale="id-ID", timezone_id="Asia/Jakarta", user_agent=UA, viewport={"width": 1366, "height": 900})
     await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-    return br, await ctx.new_page()
+    return ctx
 
 async def tunggu_hasil(page, mode, maks=28):
     """Tunggu sampai kartu hasil (harga + jam tayang) muncul; scroll agar lazy-load jalan."""
@@ -226,7 +247,7 @@ async def scrape_leg(page, mode, o, d, date, site=None):
                 dur = bus_dur(text, m)
                 print("   sumber:", u.split("/")[2], "| durasi:", f"{dur} mnt" if dur else "-", flush=True)
                 bukti = re.sub(r"\s+", " ", text[max(0, m.start() - 60): m.end()]).strip()
-                return dict(price=int(m.group(1).replace(".", "")), n=1, dur=dur, airline=None, bukti=bukti, url=u, batik=None)
+                return dict(price=int(m.group(1).replace(".", "")), n=1, dur=dur, airline=None, bukti=bukti, url=u, batik=None, cepat=None, stops=None)
         return None
     url = flight_url(site, o, d, date) if mode == "flight" else train_url(site, o, d, date)
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -242,16 +263,18 @@ async def scrape_leg(page, mode, o, d, date, site=None):
         return None
     best = min(ops, key=lambda t: t[0])
     batik = min([x for x in ops if x[2] and "batik" in x[2].lower()], key=lambda t: t[0], default=None)
-    return dict(price=best[0], n=len(ops), dur=best[1], airline=best[2], bukti=best[3], url=page.url, batik=batik)
+    cepat = min([x for x in ops if x[1]], key=lambda t: (t[1], t[0]), default=None)   # opsi dengan durasi terpendek
+    return dict(price=best[0], n=len(ops), dur=best[1], airline=best[2], bukti=best[3], url=page.url, batik=batik, cepat=cepat, stops=best[4])
 
 def baris(mode, o, d, ds, site, r):
-    """Baris yang dikirim ke dashboard: opsi termurah + (bila ada) opsi Batik Air termurah."""
-    rows = [dict(mode=mode, o=o, d=d, date=ds, price=r["price"], dur=r["dur"], airline=r["airline"],
-                 bukti=r["bukti"], url=r["url"], site=site or mode)]
-    if r.get("batik"):
-        b = r["batik"]
-        rows.append(dict(mode=mode, o=o, d=d, date=ds, price=b[0], dur=b[1], airline=b[2], bukti=b[3],
-                         url=r["url"], site=f"{site}.batik"))
+    """Baris ke dashboard: opsi TERMURAH + opsi TERCEPAT + (bila ada) opsi Batik Air termurah."""
+    def b(x, suffix=""):
+        return dict(mode=mode, o=o, d=d, date=ds, price=x[0], dur=x[1], airline=x[2], bukti=x[3], stops=x[4] if len(x) > 4 else None,
+                    url=r["url"], site=(site or mode) + suffix)
+    rows = [dict(mode=mode, o=o, d=d, date=ds, price=r["price"], dur=r["dur"], airline=r["airline"], bukti=r["bukti"],
+                 stops=r.get("stops"), url=r["url"], site=site or mode)]
+    if r.get("cepat"): rows.append(b(r["cepat"], ".cepat"))
+    if r.get("batik"): rows.append(b(r["batik"], ".batik"))
     return rows
 
 def push(batch):
@@ -266,41 +289,85 @@ def fmt(r):
     return (f"Rp{r['price']:,}  " + (f"{r['dur'] // 60}j{r['dur'] % 60:02d}m" if r["dur"] else "durasi ?")
             + (f"  {r['airline']}" if r["airline"] else ""))
 
+GAGAL, JEDA, HASIL = {}, {}, {}     # gagal berturut per situs, jeda situs, hasil {(moda,asal,tujuan,tgl): (harga, situs)}
+
+async def proses(page, db, t):
+    """t = (moda, asal, tujuan, tanggal, [situs...]): coba situs berurutan sampai ada hasil; catat & kirim ke dashboard."""
+    mode, o, d, date, sites = t
+    ds = date.isoformat() if date else "*"
+    for site in sites:
+        if site and time.time() < JEDA.get(site, 0): continue          # situs sedang dijeda
+        try:
+            r = await scrape_leg(page, mode, o, d, date, site)
+        except Exception as e:
+            print("  ERR", site or mode, o, d, ds, str(e)[:60], flush=True); r = None
+        if r:
+            GAGAL[site] = 0
+            db.execute("INSERT INTO prices VALUES(?,?,?,?,?,?,?)", (dt.datetime.now().isoformat(), mode, o, d, ds, r["price"], r["n"]))
+            db.commit()
+            push(baris(mode, o, d, ds, site, r))
+            print(f"  {mode:6} {(site or ''):9} {o}->{d} {ds}  {fmt(r)}", flush=True)
+            HASIL[(mode, o, d, ds)] = min(HASIL.get((mode, o, d, ds), (10**12, "")), (r["price"], site or mode))
+            return True
+        GAGAL[site] = GAGAL.get(site, 0) + 1
+        if site and GAGAL[site] >= 8:
+            JEDA[site] = time.time() + 1800; GAGAL[site] = 0
+            print(f"  !! {site} gagal 8x berturut-turut -> dijeda 30 menit", flush=True)
+    if mode == "bus": print(f"  {mode:6} {o}->{d} {ds}  (tidak ada harga)", flush=True)
+    return False
+
+async def paralel(br, tugas, db):
+    """Jalankan tugas dengan WORKERS halaman browser sekaligus."""
+    q = asyncio.Queue()
+    for t in tugas: q.put_nowait(t)
+    async def kerja():
+        ctx = await konteks(br); page = await ctx.new_page()
+        while True:
+            try: t = q.get_nowait()
+            except asyncio.QueueEmpty: break
+            await proses(page, db, t)
+            await asyncio.sleep(random.uniform(1.5, 4))                # jeda anti-blokir
+        await ctx.close()
+    await asyncio.gather(*[kerja() for _ in range(max(1, WORKERS))])
+
 async def run_once():
-    db = init_db(); legs = needed_legs(); gagal, jeda = {}, {}
-    print(f"[{dt.datetime.now():%H:%M}] scraping {len(legs)} leg-tanggal...", flush=True)
+    db = init_db(); legs = needed_legs(); HASIL.clear()
+    bus = [t for t in legs if t[0] == "bus"]; kereta = [t for t in legs if t[0] == "train"]; terbang = [t for t in legs if t[0] == "flight"]
+    print(f"[{dt.datetime.now():%H:%M}] {TGL_MULAI} s/d {TGL_AKHIR}: {len(bus)} rute bus, {len(kereta)} kereta, {len(terbang)} pesawat (leg-tanggal)", flush=True)
     async with async_playwright() as p:
-        br, page = await buka(p)
-        for mode, o, d, date in legs:
-            ds = date.isoformat() if date else "*"
-            for site in (FLIGHT_SITES if mode == "flight" else TRAIN_SITES if mode == "train" else [None]):
-                if site and time.time() < jeda.get(site, 0): continue        # situs sedang dijeda (gagal berturut-turut)
-                try:
-                    r = await scrape_leg(page, mode, o, d, date, site)
-                except Exception as e:
-                    print("  ERR", site or mode, o, d, ds, str(e)[:60], flush=True); r = None
-                if r:
-                    gagal[site] = 0
-                    db.execute("INSERT INTO prices VALUES(?,?,?,?,?,?,?)",
-                               (dt.datetime.now().isoformat(), mode, o, d, ds, r["price"], r["n"]))
-                    db.commit()
-                    push(baris(mode, o, d, ds, site, r))
-                    print(f"  {mode:6} {(site or ''):9} {o}->{d} {ds}  {fmt(r)}", flush=True)
-                else:
-                    gagal[site] = gagal.get(site, 0) + 1
-                    if mode == "bus": print(f"  {mode:6} {o}->{d} {ds}  (tidak ada harga)", flush=True)
-                    if site and gagal[site] >= 8:
-                        jeda[site] = time.time() + 1800; gagal[site] = 0
-                        print(f"  !! {site} gagal 8x berturut-turut -> dijeda 30 menit", flush=True)
-                await asyncio.sleep(random.uniform(2, 5))  # jeda anti-blokir
+        br = await peluncur(p)
+        print("== FASE 0: bus & kereta", flush=True)
+        await paralel(br, [(m, o, d, dte, [None]) for m, o, d, dte in bus] + [(m, o, d, dte, TRAIN_SITES) for m, o, d, dte in kereta], db)
+        # Probe: 2 tanggal per rute-arah. Rute tanpa hasil di semua OTA dilewati (hemat waktu; dicoba lagi di putaran berikutnya)
+        tgl_rute = {}
+        for m, o, d, dte in terbang: tgl_rute.setdefault((o, d), []).append(dte)
+        probe = []
+        for (o, d), lst in tgl_rute.items():
+            lst.sort(); probe += [("flight", o, d, lst[len(lst) // 4], FLIGHT_SITES), ("flight", o, d, lst[3 * len(lst) // 4], FLIGHT_SITES)]
+        print(f"== PROBE: {len(tgl_rute)} rute-arah pesawat", flush=True)
+        await paralel(br, probe, db)
+        hidup = {(o, d) for (m, o, d, ds) in HASIL if m == "flight"}
+        for rd in sorted(set(tgl_rute) - hidup): print(f"  !! rute {rd[0]}->{rd[1]} tidak terbaca di semua OTA -> dilewati putaran ini", flush=True)
+        print("== FASE 1: pesawat, setiap tanggal, OTA pertama yang berhasil (Trip.com dulu)", flush=True)
+        await paralel(br, [(m, o, d, dte, FLIGHT_SITES) for m, o, d, dte in terbang
+                           if (o, d) in hidup and ("flight", o, d, dte.isoformat()) not in HASIL], db)
+        per_rute = {}
+        for (m, o, d, ds), (harga, site) in HASIL.items():
+            if m == "flight": per_rute.setdefault((o, d), []).append((harga, ds, site))
+        tugas = [("flight", o, d, dt.date.fromisoformat(ds), [s2])
+                 for (o, d), lst in per_rute.items() for harga, ds, site in sorted(lst)[:K_VERIFIKASI]
+                 for s2 in FLIGHT_SITES if s2 != site]
+        print(f"== FASE 2: verifikasi silang {len(tugas)} halaman ({K_VERIFIKASI} tanggal termurah per rute di OTA lain)", flush=True)
+        await paralel(br, tugas, db)
         await br.close()
+    print("== SELESAI. Tanggal pergi/pulang termurah per skenario: lihat dashboard.", flush=True)
 
 async def cek(mode, o, d, ds):
     """Uji cepat satu rute di semua sumber:  python tiketscout.py cek flight DPS PKU 2027-03-01"""
     date = None if mode == "bus" else dt.date.fromisoformat(ds)
     sites = FLIGHT_SITES if mode == "flight" else TRAIN_SITES if mode == "train" else [None]
     async with async_playwright() as p:
-        br, page = await buka(p)
+        br = await peluncur(p); page = await (await konteks(br)).new_page()
         for site in sites:
             try: r = await scrape_leg(page, mode, o, d, date, site)
             except Exception as e: r = None; print("  ERR", site, str(e)[:80], flush=True)
