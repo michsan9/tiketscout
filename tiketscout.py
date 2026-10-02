@@ -67,12 +67,16 @@ def url_for(mode, o, d, date):
 SLUG = {"Denpasar": "denpasar-bali"}
 FROM_RE = re.compile(r"(?:mulai dari|harga mulai)\s*Rp[\s\xa0]*([\d]{1,3}(?:\.\d{3})+)", re.I)
 
+GUIDE_RE = re.compile(r"mulai sekitar\s*Rp[\s\xa0]*([\d]{1,3}(?:\.\d{3})+)\s*per orang", re.I)     # tarif shuttle di panduan Trip.com
+GUIDE_URL = "https://id.trip.com/guide/transport/denpasar-ke-singaraja.html"                      # tarif Singaraja Trans berlaku dua arah
+
 def bus_urls(o, d):
     """Daftar sumber harga bus/travel (shuttle) berurutan; dicoba sampai ada harga."""
     pairs = []
     for a, b in [(SLUG.get(o, o), SLUG.get(d, d)), (o, d)]:
         if (a.lower(), b.lower()) not in pairs: pairs.append((a.lower(), b.lower()))
-    urls = []
+    # Singaraja-Denpasar dilayani shuttle/travel lokal yang TIDAK terdaftar di redBus; tarifnya ada di panduan Trip.com
+    urls = [GUIDE_URL] if {o, d} == {"Singaraja", "Denpasar"} else []
     for a, b in pairs:
         urls += [f"https://www.redbus.id/tiket-bus/{a}-ke-{b}",                      # bus + travel
                  f"https://www.busonlineticket.co.id/id-id/tiket-bus-{a}-ke-{b}",     # bus
@@ -179,7 +183,10 @@ def opsi(text, mode):
         out = [x for x in out if x[0] >= 0.35 * med]
     return out
 
-def bus_dur(text, m):
+def bus_dur(text, m, url=""):
+    if "guide/transport" in url:                       # panduan: 'biasanya membutuhkan sekitar 2,5-4 jam' -> pakai batas atas
+        g = re.search(r"sekitar\s*(\d+(?:[.,]\d+)?)\s*[\u2013-]\s*(\d+(?:[.,]\d+)?)\s*jam", text, re.I)
+        if g: return int(float(g.group(2).replace(",", ".")) * 60)
     """Durasi rata-rata rute dari halaman rute bus (label 'Durasi/Duration' atau angka tepat sebelum harga termurah)."""
     lab = re.search(r"(?:durasi|duration)[^\d]{0,50}", text, re.I)
     if lab:
@@ -287,9 +294,9 @@ async def scrape_leg(page, mode, o, d, date, site=None):
                 text = await page.inner_text("body")
             except Exception:
                 continue
-            m = BUS_RE.search(text) or FROM_RE.search(text)
+            m = BUS_RE.search(text) or GUIDE_RE.search(text) or FROM_RE.search(text)
             if m and int(m.group(1).replace(".", "")) >= MIN_HARGA["bus"]:
-                dur = bus_dur(text, m)
+                dur = bus_dur(text, m, u)
                 print("   sumber:", u.split("/")[2], "| durasi:", f"{dur} mnt" if dur else "-", flush=True)
                 bukti = re.sub(r"\s+", " ", text[max(0, m.start() - 60): m.end()]).strip()
                 return dict(price=int(m.group(1).replace(".", "")), n=1, dur=dur, airline=None, bukti=bukti, url=u, batik=None, cepat=None, stops=None, ops=[])
