@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       cek:
-        description: 'Uji cepat 1 rute di semua OTA (kosongkan untuk pencarian penuh). Contoh: DPS CGK 2027-03-05 | CGK PKU 2027-03-05 | SUB KUL 2027-03-05'
+        description: 'Uji cepat 1 rute di semua OTA (kosongkan untuk pencarian penuh). Contoh: DPS CGK 2027-03-05 | SUB KUL 2027-03-05 | url https://situs-ota-lain/pencarian-yang-Anda-salin'
         required: false
         default: ''
 concurrency:
@@ -33,6 +33,7 @@ jobs:
           DPS_PKU: ${{ vars.DPS_PKU }}             # opsional: 1 = tambahkan tiket tunggal DPS->PKU (transit dipilihkan OTA)
           KURS_USD_IDR: ${{ vars.KURS_USD_IDR }}   # opsional: kurs USD->IDR buatan Anda sendiri (untuk Agoda bila tampil USD); kosong = tidak dikonversi
         run: |
+          set -f   # cegah '?' dan '*' pada URL diperlakukan sebagai pola file
           if [ -n "$CEK" ]; then python -u tiketscout.py cek $CEK; else python -u tiketscout.py once; fi
       - uses: actions/upload-artifact@v4
         if: always()
