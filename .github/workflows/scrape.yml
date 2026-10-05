@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       cek:
-        description: 'Uji cepat 1 rute (kosongkan untuk scraping penuh). Contoh: flight DPS PKU 2027-03-01 | train KTG PSE 2027-03-01 | bus Singaraja Surabaya 2027-03-01'
+        description: 'Uji cepat 1 rute di semua OTA (kosongkan untuk pencarian penuh). Contoh: DPS CGK 2027-03-05 | CGK PKU 2027-03-05 | SUB KUL 2027-03-05'
         required: false
         default: ''
 concurrency:
@@ -29,6 +29,9 @@ jobs:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_KEY: ${{ secrets.INGEST_KEY }}
           CEK: ${{ github.event.inputs.cek }}
+          OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
+          DPS_PKU: ${{ vars.DPS_PKU }}             # opsional: 1 = tambahkan tiket tunggal DPS->PKU (transit dipilihkan OTA)
+          KURS_USD_IDR: ${{ vars.KURS_USD_IDR }}   # opsional: kurs USD->IDR buatan Anda sendiri (untuk Agoda bila tampil USD); kosong = tidak dikonversi
         run: |
           if [ -n "$CEK" ]; then python -u tiketscout.py cek $CEK; else python -u tiketscout.py once; fi
       - uses: actions/upload-artifact@v4
