@@ -13,6 +13,7 @@ ALUR
 PAKAI
     python tiketscout.py once                         # cari semua tanggal, susun skenario, kirim ke dashboard
     python tiketscout.py cek DPS CGK 2027-03-05       # uji 1 rute di semua OTA (lihat kartu yang terbaca)
+    python tiketscout.py cek url "https://..."         # uji URL pencarian OTA lain (salin dari browser Anda)
     python tiketscout.py login                        # PC sendiri: buka browser, selesaikan verifikasi 'saya bukan robot' SECARA MANUAL
 """
 import asyncio, json, os, random, re, sys, time, urllib.request, datetime as dt
@@ -86,12 +87,14 @@ def to_min(m):
 def jam(s):                                         # '5.20' -> '05:20'
     h, m = re.split(r"[:.]", s); return f"{int(h):02d}:{m}"
 
+ALIAS = {"Lion": "Lion Air", "Super Air": "Super Air Jet", "Indonesia AirAsia": "AirAsia", "Air Asia": "AirAsia"}
+
 def maskapai(t):
     best = None
-    for n in AIRLINES:
+    for n in AIRLINES + list(ALIAS):
         for x in re.finditer(re.escape(n), t, re.I):
             if best is None or x.start() < best[0] or (x.start() == best[0] and len(n) > len(best[1])): best = (x.start(), n)
-    return best[1] if best else None
+    return ALIAS.get(best[1], best[1]) if best else None
 
 def kartu(t):
     """Teks SATU kartu hasil -> dict(harga, dep, arr, dur, maskapai, transit, bukti) atau None.
@@ -224,6 +227,20 @@ async def tunggu_hasil(page, maks=None):
         except Exception: pass
     return text, []
 
+async def muat_lebih(page, cards):
+    """Hasil OTA sering dimuat bertahap: scroll ke bawah dan klik 'Lihat lebih banyak' (seperti pengguna) sampai kartu tidak bertambah."""
+    for _ in range(3):
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.get_by_role("button", name=re.compile(r"lihat lebih banyak|tampilkan lebih banyak|muat lebih|show more|load more", re.I)).first.click(timeout=1200)
+        except Exception: pass
+        await page.wait_for_timeout(2000)
+        try: baru = await ambil_kartu(page, await page.inner_text("body"))
+        except Exception: break
+        if len(baru) <= len(cards): break
+        cards = baru
+    return cards
+
 GAGAL, JEDA = {}, {}
 
 async def tutup_consent(page):
@@ -240,7 +257,9 @@ async def baca(page, site, o, d, date):
     await page.goto(flight_url(site, o, d, date), wait_until="domcontentloaded", timeout=60000)
     if site == "google": await tutup_consent(page)
     text, cards = await tunggu_hasil(page)
+    if cards: cards = await muat_lebih(page, cards)
     if len(text) < 2500 and BOT_RE.search(text):
+        print(f"     {site}: isi halaman: {re.sub(chr(10), ' ', text[:160])!r}", flush=True)
         print(f"     {site}: halaman VERIFIKASI ANTI-BOT -> situs dilewati 6 jam (tidak ditembus; lihat 'login' untuk verifikasi manual di PC sendiri)", flush=True)
         JEDA[site] = time.time() + 6 * 3600
         return None
@@ -252,7 +271,7 @@ async def baca(page, site, o, d, date):
             try: await page.screenshot(path=f"gagal_{site}_{o}_{d}_{date}.png")
             except Exception: pass
         return None
-    return dict(cards=cards, url=page.url, site=site)
+    return dict(cards=cards, url=flight_url(site, o, d, date), site=site)
 
 # ============================ PENYIMPANAN KARTU & PENGIRIMAN ============================
 CARDS = {}                                          # (asal, tujuan, tanggal) -> {kunci: kartu}
@@ -431,6 +450,26 @@ async def cek(o, d, ds):
             except Exception: pass
         await br.close()
 
+async def cek_url(url):
+    """Uji URL pencarian OTA APA SAJA (salin dari browser Anda): apakah kartunya bisa dibaca dari server?"""
+    CEK_MODE[0] = True; MAKS_TUNGGU[0] = 45
+    async with async_playwright() as p:
+        br = await peluncur(p); page = await (await konteks(br)).new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        text, cards = await tunggu_hasil(page)
+        if cards: cards = await muat_lebih(page, cards)
+        if len(text) < 2500 and BOT_RE.search(text):
+            print("CEK-URL: halaman VERIFIKASI ANTI-BOT (situs ini tidak bisa dibaca otomatis dari server)", flush=True)
+            print("   isi halaman:", re.sub(r"\s+", " ", text[:200]), flush=True)
+        print(f"CEK-URL {url[:110]}: {len(cards)} kartu", flush=True)
+        for c in sorted(cards, key=lambda x: x["harga"])[:10]:
+            print(f"      Rp{c['harga']:>10,} | {c['dep']}->{c['arr']} | " + (f"{c['dur'] // 60}j{c['dur'] % 60:02d}m" if c["dur"] else "durasi ?") + f" | {c['maskapai'] or '-'} | {c['transit'] or '-'}", flush=True)
+        if not cards: await diagnosa(page, text, "url")
+        simpan_teks("cek_url", text, page.url)
+        try: await page.screenshot(path="cek_url.png")
+        except Exception: pass
+        await br.close()
+
 async def login():
     """PC sendiri (bukan GitHub): buka browser berprofil tetap. Anda menyelesaikan verifikasi 'saya bukan robot' SECARA MANUAL;
     cookie tersimpan di PROFIL_DIR dan dipakai saat 'once' dijalankan dengan PROFIL_DIR yang sama."""
@@ -448,6 +487,7 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "once"
     if cmd == "once": asyncio.run(run_once())
     elif cmd == "cek":
-        a = [x for x in sys.argv[2:] if x.lower() != "flight"]; asyncio.run(cek(*a[:3]))
+        a = [x for x in sys.argv[2:] if x.lower() != "flight"]
+        asyncio.run(cek_url(a[1]) if a and a[0] == "url" else cek(*a[:3]))
     elif cmd == "login": asyncio.run(login())
     else: print(__doc__)
