@@ -8,7 +8,7 @@ ALUR
  3. Setelah semua data terbaca, susun BEBERAPA skenario termurah. Penerbangan lanjutan harus berangkat
     minimal MIN_TRANSIT menit (2 jam) dan maksimal MAX_TRANSIT (12 jam) setelah penerbangan pertama mendarat (zona waktu bandara dihitung).
  4. Travel Singaraja->Denpasar Rp145.000, bus Singaraja->Surabaya Rp250.000 (ditetapkan pengguna).
- Pergi DAN pulang dicari di setiap tanggal 1-31 Maret 2027.
+ Pergi DAN pulang dicari di setiap tanggal (default 1-31 Maret 2027; ubah lewat variabel TGL_MULAI / TGL_AKHIR).
 
 PAKAI
     python tiketscout.py once                         # cari semua tanggal, susun skenario, kirim ke dashboard
@@ -23,7 +23,8 @@ from playwright.async_api import async_playwright
 # ============================ KONFIGURASI ============================
 INGEST_URL = os.environ.get("INGEST_URL")          # https://domain/index.php?a=ingest
 INGEST_KEY = os.environ.get("INGEST_KEY")
-TGL_MULAI, TGL_AKHIR = dt.date(2027, 3, 1), dt.date(2027, 3, 31)
+TGL_MULAI = dt.date.fromisoformat(os.environ.get("TGL_MULAI") or "2027-03-01")     # bisa diatur, mis. 2027-02-27 (akhir pekan sebelum cuti)
+TGL_AKHIR = dt.date.fromisoformat(os.environ.get("TGL_AKHIR") or "2027-03-31")
 MIN_TRANSIT = 120                                  # menit antara mendarat dan penerbangan berikutnya (minimal 2 jam)
 MAX_TRANSIT = int(os.environ.get("MAX_TRANSIT") or 720)   # singgah > 12 jam dianggap tidak praktis (ubah bila perlu)
 BIAYA_DARAT = {"DPS": 145_000, "SUB": 250_000}     # Singaraja -> gerbang (ditetapkan pengguna)
@@ -34,7 +35,7 @@ JALUR = [("DPS", ["DPS", "CGK", "PKU"]), ("DPS", ["DPS", "KUL", "PKU"]), ("DPS",
          ("SUB", ["SUB", "PKU"]),        ("SUB", ["SUB", "KUL", "PKU"]), ("SUB", ["SUB", "SIN", "PKU"])]
 if os.environ.get("DPS_PKU") == "1":               # opsional: tiket tunggal DPS->PKU (OTA memilihkan transitnya)
     JALUR.append(("DPS", ["DPS", "PKU"]))
-FLIGHT_SITES = ["trip", "google", "agoda", "traveloka", "airasia"]   # cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
+FLIGHT_SITES = ["trip", "agoda", "google", "traveloka", "airasia"]   # cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
 OTA_SEMUA = os.environ.get("OTA_SEMUA") == "1"             # 1 = baca SEMUA OTA untuk tiap rute-tanggal lalu gabungkan (lebih lama)
 WORKERS = int(os.environ.get("WORKERS") or 4)              # halaman browser paralel
 KURS_USD = float(os.environ.get("KURS_USD_IDR") or 0)      # opsional, diisi sendiri (Agoda kadang tampil USD)
@@ -116,6 +117,18 @@ def kartu(t):
     sm = list(STOPS_RE.finditer(t))
     return dict(harga=min(harga), dep=jam(times[0].group(0)), arr=jam(times[1].group(0)), dur=dur, maskapai=maskapai(t),
                 transit=sm[-1].group(0).strip().capitalize() if sm else None, bukti=re.sub(r"\s+", " ", t).strip()[:170])
+
+def cocokkan(c, o, d):
+    """Verifikasi silang kartu: berangkat + durasi harus = jam tiba (selisih zona waktu o->d dihitung).
+    Cocok (+-10 mnt) -> durasi dipakai dari jam tayang (tepat). Tidak cocok -> kartu DIBUANG (salah baca). Tanpa durasi -> dihitung dari jam."""
+    base = dt.date(2027, 1, 1); dep = utc(o, base, c["dep"]); best = None
+    for k in range(3):
+        m = int((utc(d, base + dt.timedelta(days=k), c["arr"]) - dep).total_seconds() // 60)
+        if m <= 0: continue
+        if c["dur"] is None: best = (m, k); break
+        if best is None or abs(m - c["dur"]) < abs(best[0] - c["dur"]): best = (m, k)
+    if best is None or (c["dur"] is not None and abs(best[0] - c["dur"]) > 10): return None
+    return dict(c, dur=best[0])
 
 def kartu_dari_teks(text):
     """Cadangan bila DOM tidak memberi kartu: potong teks halaman per harga."""
@@ -232,7 +245,7 @@ async def muat_lebih(page, cards):
     for _ in range(3):
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.get_by_role("button", name=re.compile(r"lihat lebih banyak|tampilkan lebih banyak|muat lebih|show more|load more", re.I)).first.click(timeout=1200)
+            await page.get_by_role("button", name=re.compile(r"lihat lebih banyak|tampilkan lebih banyak|penerbangan lainnya|lihat semua|muat lebih|more flights|show more|load more", re.I)).first.click(timeout=1200)
         except Exception: pass
         await page.wait_for_timeout(2000)
         try: baru = await ambil_kartu(page, await page.inner_text("body"))
@@ -271,6 +284,10 @@ async def baca(page, site, o, d, date):
             try: await page.screenshot(path=f"gagal_{site}_{o}_{d}_{date}.png")
             except Exception: pass
         return None
+    sebelum = len(cards); cards = [x for x in (cocokkan(c, o, d) for c in cards) if x]
+    if len(cards) < sebelum: print(f"     {site}: {sebelum - len(cards)} kartu dibuang (jam & durasi tidak cocok = salah baca)", flush=True)
+    if not cards:
+        print(f"     {site}: semua kartu tidak konsisten", flush=True); return None
     return dict(cards=cards, url=flight_url(site, o, d, date), site=site)
 
 # ============================ PENYIMPANAN KARTU & PENGIRIMAN ============================
