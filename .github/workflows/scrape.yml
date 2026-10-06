@@ -29,6 +29,8 @@ jobs:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_KEY: ${{ secrets.INGEST_KEY }}
           CEK: ${{ github.event.inputs.cek }}
+          TGL_MULAI: ${{ vars.TGL_MULAI }}         # opsional, mis. 2027-02-27 (akhir pekan sebelum cuti); kosong = 2027-03-01
+          TGL_AKHIR: ${{ vars.TGL_AKHIR }}         # opsional; kosong = 2027-03-31
           OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
           DPS_PKU: ${{ vars.DPS_PKU }}             # opsional: 1 = tambahkan tiket tunggal DPS->PKU (transit dipilihkan OTA)
           KURS_USD_IDR: ${{ vars.KURS_USD_IDR }}   # opsional: kurs USD->IDR buatan Anda sendiri (untuk Agoda bila tampil USD); kosong = tidak dikonversi
