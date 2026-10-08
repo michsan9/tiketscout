@@ -1,0 +1,30 @@
+# Simpan sebagai: .github/workflows/jaga-jadwal.yml
+# Pengawas: tiap jam memastikan 'scrape-tiket' aktif, dan memicunya bila tidak ada putaran selama > 4 jam
+# (mis. jadwal cron GitHub tertunda/terlewat). Bila dua workflow ini sama-sama mati, klik 'Enable workflow' di tab Actions.
+name: jaga-jadwal
+on:
+  schedule:
+    - cron: '23 * * * *'          # tiap jam, menit ke-23 (UTC)
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: read
+jobs:
+  jaga:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pastikan scrape-tiket aktif dan tidak terlewat
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh workflow enable scrape.yml --repo "$REPO" || true
+          jalan=$(gh run list --workflow scrape.yml --repo "$REPO" --limit 30 --json status -q '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length')
+          terakhir=$(gh run list --workflow scrape.yml --repo "$REPO" --limit 1 --json createdAt -q '.[0].createdAt // empty')
+          if [ -n "$terakhir" ]; then umur=$(( $(date +%s) - $(date -d "$terakhir" +%s) )); else umur=999999; fi
+          echo "antre/berjalan: ${jalan:-0} | umur putaran terakhir: $((umur/60)) menit"
+          if [ "${jalan:-0}" -eq 0 ] && [ "$umur" -gt 14400 ]; then
+            echo "Tidak ada putaran > 4 jam: memicu scrape-tiket"
+            gh workflow run scrape.yml --repo "$REPO"
+          fi
