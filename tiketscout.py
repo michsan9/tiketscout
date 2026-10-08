@@ -14,6 +14,7 @@ PAKAI
     python tiketscout.py once                         # cari semua tanggal, susun skenario, kirim ke dashboard
     python tiketscout.py cek DPS CGK 2027-03-05       # uji 1 rute di semua OTA (lihat kartu yang terbaca)
     python tiketscout.py cek url "https://..."         # uji URL pencarian OTA lain (salin dari browser Anda)
+    OTA_TAMBAHAN='{"namasitus":"https://...{o}...{iso}"}'  # tambah OTA lain tanpa ubah kode (lihat isi_templat)
     python tiketscout.py login                        # PC sendiri: buka browser, selesaikan verifikasi 'saya bukan robot' SECARA MANUAL
 """
 import asyncio, json, os, random, re, sys, time, urllib.request, datetime as dt
@@ -35,10 +36,18 @@ JALUR = [("DPS", ["DPS", "CGK", "PKU"]), ("DPS", ["DPS", "KUL", "PKU"]), ("DPS",
          ("SUB", ["SUB", "PKU"]),        ("SUB", ["SUB", "KUL", "PKU"]), ("SUB", ["SUB", "SIN", "PKU"])]
 if os.environ.get("DPS_PKU") == "1":               # opsional: tiket tunggal DPS->PKU (OTA memilihkan transitnya)
     JALUR.append(("DPS", ["DPS", "PKU"]))
-FLIGHT_SITES = ["trip", "agoda", "google", "traveloka", "airasia"]   # cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
+FLIGHT_SITES = ["trip", "agoda", "google", "traveloka", "airasia", "batikair", "scoot"]   # cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
+LANGSUNG = {"batikair", "scoot"}     # situs MASKAPAI: hanya menjual penerbangan sendiri -> pembanding (cek silang / OTA_SEMUA), bukan cadangan cascade
+try:   # sumber tambahan tanpa ubah kode: {"namasitus": "https://...{o}...{iso}"}  (isi dari URL hasil pencarian di browser Anda)
+    EXTRA = {k: v for k, v in json.loads(os.environ.get("OTA_TAMBAHAN") or "{}").items() if re.fullmatch(r"[a-z0-9]+", k) and str(v).startswith("https://")}
+except Exception as e:
+    print("OTA_TAMBAHAN bukan JSON valid, diabaikan:", e, flush=True); EXTRA = {}
+FLIGHT_SITES += [k for k in EXTRA if k not in FLIGHT_SITES]
+NOROUTE = {}     # (situs, asal, tujuan) -> berapa kali kosong; situs maskapai dilewati setelah 2x kosong (maskapai itu tidak terbang di rute tsb)
 OTA_SEMUA = os.environ.get("OTA_SEMUA") == "1"             # 1 = baca SEMUA OTA untuk tiap rute-tanggal lalu gabungkan (lebih lama)
-WORKERS = int(os.environ.get("WORKERS") or 4)              # halaman browser paralel
-KURS_USD = float(os.environ.get("KURS_USD_IDR") or 0)      # opsional, diisi sendiri (Agoda kadang tampil USD)
+WORKERS = int(os.environ.get("WORKERS") or 4)
+K_SILANG = int(os.environ.get("K_SILANG") or 3)            # cek silang: K tanggal termurah per rute dibaca juga di sumber LAIN (0 = matikan)              # halaman browser paralel
+KURS = {"USD": float(os.environ.get("KURS_USD_IDR") or 0), "MYR": float(os.environ.get("KURS_MYR_IDR") or 0), "SGD": float(os.environ.get("KURS_SGD_IDR") or 0)}   # opsional, diisi SENDIRI bila situs menampilkan mata uang asing
 PROFIL_DIR = os.environ.get("PROFIL_DIR")                  # opsional: profil browser tetap (untuk verifikasi manual di PC sendiri)
 HEADLESS = os.environ.get("HEADED") != "1"
 MIN_HARGA, MAX_HARGA = 300_000, 30_000_000
@@ -47,8 +56,28 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 # ============================ URL PENCARIAN ============================
 TRIP_ID = {"DPS": 723, "PKU": 5604}                # id kota Trip.com yang diketahui (dari URL contoh)
 
+BLN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+def tgl_txt(date):                                   # 10 Oct 2026 -> 10%20Oct%202026
+    return f"{date.day:02d}%20{BLN[date.month - 1]}%20{date.year}"
+
+def isi_templat(t, o, d, date):
+    """Placeholder: {o} {d} {o_lc} {d_lc} {iso}=2027-03-05 {dmy}=05-03-2027 {dmy2}=05/03/2027 {ymd}=20270305 {y} {m} {day}"""
+    for k, v in {"{o}": o, "{d}": d, "{o_lc}": o.lower(), "{d_lc}": d.lower(), "{iso}": date.isoformat(), "{dmy}": date.strftime("%d-%m-%Y"),
+                 "{dmy2}": date.strftime("%d/%m/%Y"), "{dmy2e}": date.strftime("%d%%2F%m%%2F%Y"), "{txt}": tgl_txt(date), "{txt_p7}": tgl_txt(date + dt.timedelta(days=7)), "{ymd}": date.strftime("%Y%m%d"), "{y}": str(date.year), "{m}": f"{date.month:02d}", "{day}": f"{date.day:02d}"}.items():
+        t = t.replace(k, v)
+    return t
+
 def flight_url(site, o, d, date):
+    if site in EXTRA: return isi_templat(EXTRA[site], o, d, date)
     iso, dmy, dmy2 = date.isoformat(), date.strftime("%d-%m-%Y"), date.strftime("%d/%m/%Y")
+    if site == "batikair":       # flights.batikair.com: Jtype=1 (sekali jalan; contoh pengguna memakai Jtype=2 untuk pulang-pergi) - uji dengan 'cek'
+        e = date.strftime("%d%%2F%m%%2F%Y")
+        return (f"https://flights.batikair.com/default.aspx?aid=231&Jtype=1&depCity={o}&arrCity={d}&depDate={e}&arrDate={e}&currency=&adult1=1&child1=0&infant1=0"
+                "&culture=en-GB&df=UK&afid=0&b2b=0&St=fa&DFlight=false&roomcount=1")
+    if site == "scoot":          # booking.flyscoot.com: format 'return' dari contoh pengguna; tanggal pulang = berangkat + 7 hari (hanya daftar penerbangan pergi yang dibaca)
+        return (f"https://booking.flyscoot.com/book/flight/return/{o}/{tgl_txt(date)}/{d}/{d}/{tgl_txt(date + dt.timedelta(days=7))}/{o}"
+                "?adult=1&child=0&infant=0&cur=IDR&culture=en-sg")
     if site == "trip":
         u = f"https://id.trip.com/flights/showfarefirst?dcity={o.lower()}&acity={d.lower()}&ddate={iso}"
         if o in TRIP_ID: u += f"&dcityid={TRIP_ID[o]}"
@@ -66,7 +95,7 @@ def flight_url(site, o, d, date):
 
 # ============================ MEMBACA KARTU HASIL ============================
 PRICE_RE = re.compile(r"(?:Rp|IDR)[\s\xa0]*([\d]{1,3}(?:[.,]\d{3})+)", re.I)
-USD_RE = re.compile(r"USD[\s\xa0]*\$?[\s\xa0]*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)")
+CUR_RE = re.compile(r"\b(USD|MYR|SGD|RM)[\s\xa0]*\$?[\s\xa0]*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)")
 TIME_RE = re.compile(r"(?<![\d.,])(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)")                 # 12:25 / 12.25 / 5.20
 DUR_RE = re.compile(r"(\d{1,3})\s*(?:jam|j|h|hrs?|hours?)(?![a-z])(?:\s*(\d{1,2})\s*(?:menit|mnt|m|mins?|minutes?)(?![a-z]))?", re.I)
 STOPS_RE = re.compile(r"langsung|non-?stop|direct|\d+\s*(?:transit|stops?|pemberhentian)", re.I)
@@ -78,8 +107,12 @@ AIRLINES = ["Batik Air Malaysia", "Batik Air", "Malaysia Airlines", "Lion Air", 
             "Pelita Air", "AirAsia", "TransNusa", "Wings Air", "Scoot", "Singapore Airlines", "Sriwijaya", "Jetstar", "Malindo"]
 
 def konversi_usd(t):
-    if not KURS_USD: return t
-    return USD_RE.sub(lambda m: "Rp" + f"{int(float(m.group(1).replace(',', '')) * KURS_USD):,}".replace(",", ".") + "~kurs", t)
+    """Harga bermata uang asing (USD/MYR/SGD/RM) -> Rp, HANYA bila kursnya Anda isi sendiri; ditandai '~kurs'."""
+    if not any(KURS.values()): return t
+    def ganti(m):
+        k = KURS.get("MYR" if m.group(1) == "RM" else m.group(1), 0)
+        return m.group(0) if not k else "Rp" + f"{int(float(m.group(2).replace(',', '')) * k):,}".replace(",", ".") + "~kurs"
+    return CUR_RE.sub(ganti, t)
 
 def to_min(m):
     v = int(m.group(1)) * 60 + (int(m.group(2)) if m.group(2) else 0)
@@ -380,6 +413,41 @@ def hitung_dan_kirim(tampil=False):
     return ringkas
 
 # ============================ ALUR PENCARIAN ============================
+def status(s, info=""):
+    """Detak ke dashboard: mulai / progres / selesai / gagal."""
+    if INGEST_URL: post(INGEST_URL.replace("a=ingest", "a=status"), dict(key=INGEST_KEY, status=s, info=info))
+
+def umpan(o, d, ds, c, site, url):
+    post(INGEST_URL, dict(key=INGEST_KEY, rows=[dict(mode="flight", o=o, d=d, date=ds, price=c["harga"], dur=c["dur"], airline=c["maskapai"],
+                                                  bukti=c["bukti"], url=url, stops=c["transit"], site=site)]))
+
+async def proses_silang(page, t):
+    """Baca satu sumber PEMBANDING untuk rute-tanggal tertentu; hasilnya hanya untuk tabel cek silang (tidak mengubah skenario)."""
+    o, d, date, site = t; ds = date.isoformat()
+    if time.time() < JEDA.get(site, 0) or NOROUTE.get((site, o, d), 0) >= 2: return False
+    try: r = await baca(page, site, o, d, date)
+    except Exception as e: print("  ERR", site, o, d, ds, str(e)[:60], flush=True); r = None
+    if not r and site in LANGSUNG and time.time() >= JEDA.get(site, 0):
+        NOROUTE[(site, o, d)] = NOROUTE.get((site, o, d), 0) + 1; return False
+    if not r:
+        GAGAL[site] = GAGAL.get(site, 0) + 1
+        if GAGAL[site] >= 8: JEDA[site] = time.time() + 1800; GAGAL[site] = 0
+        return False
+    GAGAL[site] = 0; c = min(r["cards"], key=lambda x: x["harga"]); umpan(o, d, ds, c, site, r["url"])
+    print(f"  silang {site:9} {o}->{d} {ds}  termurah Rp{c['harga']:,}", flush=True); return True
+
+def daftar_silang():
+    """Untuk K tanggal termurah tiap rute: kirim ulang baris sumber utama (agar berpasangan) + antrekan sumber lain."""
+    tugas = []; per = {}
+    for (o, d, ds), kartu in CARDS.items():
+        if kartu: per.setdefault((o, d), []).append((min(c["harga"] for c in kartu.values()), ds))
+    for (o, d), lst in per.items():
+        for _, ds in sorted(lst)[:K_SILANG]:
+            kartu = CARDS[(o, d, ds)]; c = min(kartu.values(), key=lambda x: x["harga"])
+            umpan(o, d, ds, c, c["sumber"], c["url"])
+            tugas += [(o, d, dt.date.fromisoformat(ds), site) for site in FLIGHT_SITES if site not in {x["sumber"] for x in kartu.values()}]
+    return tugas
+
 def rute_semua():
     s = set()
     for _, ap in JALUR:
@@ -394,8 +462,8 @@ STAT = dict(ok=0, kosong=0)
 
 async def proses(page, t):
     o, d, date = t; ds = date.isoformat(); berhasil = False
-    for site in FLIGHT_SITES:
-        if time.time() < JEDA.get(site, 0): continue
+    for site in (FLIGHT_SITES if OTA_SEMUA else [x for x in FLIGHT_SITES if x not in LANGSUNG]):
+        if time.time() < JEDA.get(site, 0) or NOROUTE.get((site, o, d), 0) >= 2: continue
         try: r = await baca(page, site, o, d, date)
         except Exception as e: print("  ERR", site, o, d, ds, str(e)[:60], flush=True); r = None
         if r:
@@ -405,9 +473,11 @@ async def proses(page, t):
                                                           bukti=c["bukti"], url=r["url"], stops=c["transit"], site=site)]))
             print(f"  {site:9} {o}->{d} {ds}  {len(r['cards']):>2} kartu | termurah Rp{c['harga']:,} {c['dep']} " +
                   (f"{c['dur'] // 60}j{c['dur'] % 60:02d}m" if c["dur"] else "durasi ?") + f" {c['maskapai'] or ''} {c['transit'] or ''}", flush=True)
+            if STAT["ok"] % 40 == 0: status("progres", f"{STAT['ok']} halaman terbaca")
             if STAT["ok"] % 80 == 0: hitung_dan_kirim()               # dashboard ikut terisi selama proses berjalan
             if not OTA_SEMUA: return True
             continue
+        if site in LANGSUNG and time.time() >= JEDA.get(site, 0): NOROUTE[(site, o, d)] = NOROUTE.get((site, o, d), 0) + 1; continue      # kosong biasa (maskapai tak terbang di rute ini)
         GAGAL[site] = GAGAL.get(site, 0) + 1
         if GAGAL[site] >= 8:
             JEDA[site] = time.time() + 1800; GAGAL[site] = 0
@@ -415,7 +485,7 @@ async def proses(page, t):
     if not berhasil: STAT["kosong"] += 1
     return berhasil
 
-async def paralel(br, tugas):
+async def paralel(br, tugas, fn=None):
     q = asyncio.Queue()
     for t in tugas: q.put_nowait(t)
     async def kerja():
@@ -423,11 +493,18 @@ async def paralel(br, tugas):
         while True:
             try: t = q.get_nowait()
             except asyncio.QueueEmpty: break
-            await proses(page, t); await asyncio.sleep(random.uniform(1.5, 4))
+            await (fn or proses)(page, t); await asyncio.sleep(random.uniform(1.5, 4))
         await ctx.close()
     await asyncio.gather(*[kerja() for _ in range(max(1, WORKERS))])
 
 async def run_once():
+    status("mulai", f"{TGL_MULAI} s/d {TGL_AKHIR}")
+    try: await _run_once()
+    except BaseException as e:
+        status("gagal", repr(e)[:150]); raise
+    status("selesai", f"{STAT['ok']} halaman terbaca, {STAT['kosong']} kosong")
+
+async def _run_once():
     CARDS.clear(); tugas = tugas_semua(); per_rute = {}
     for o, d, date in tugas: per_rute.setdefault((o, d), []).append(date)
     print(f"[{dt.datetime.now():%H:%M}] {TGL_MULAI} s/d {TGL_AKHIR}: {len(per_rute)} rute x {len(tugas) // len(per_rute)} tanggal = {len(tugas)} pencarian", flush=True)
@@ -440,6 +517,10 @@ async def run_once():
         for o, d in sorted(set(per_rute) - hidup): print(f"  !! rute {o}->{d} tidak terbaca di semua OTA -> dilewati putaran ini", flush=True)
         print("== PENCARIAN: setiap tanggal untuk tiap rute", flush=True)
         await paralel(br, [t for t in tugas if (t[0], t[1]) in hidup and (t[0], t[1], t[2].isoformat()) not in CARDS])
+        hitung_dan_kirim()                                         # skenario sudah bisa dilihat sebelum cek silang selesai
+        if K_SILANG:
+            ts = daftar_silang(); print(f"== CEK SILANG: {len(ts)} halaman (sumber lain untuk {K_SILANG} tanggal termurah per rute)", flush=True)
+            await paralel(br, ts, proses_silang)
         await br.close()
     hitung_dan_kirim(tampil=True)
     print("== SELESAI.", STAT, flush=True)
