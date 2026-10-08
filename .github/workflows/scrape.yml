@@ -31,8 +31,11 @@ jobs:
           CEK: ${{ github.event.inputs.cek }}
           TGL_MULAI: ${{ vars.TGL_MULAI }}         # opsional, mis. 2027-02-27 (akhir pekan sebelum cuti); kosong = 2027-03-01
           TGL_AKHIR: ${{ vars.TGL_AKHIR }}         # opsional; kosong = 2027-03-31
+          OTA_TAMBAHAN: ${{ vars.OTA_TAMBAHAN }}   # opsional: OTA lain, JSON mis. {"namasitus":"https://...{o}...{iso}"} (lihat isi_templat di tiketscout.py)
           OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
           DPS_PKU: ${{ vars.DPS_PKU }}             # opsional: 1 = tambahkan tiket tunggal DPS->PKU (transit dipilihkan OTA)
+          KURS_MYR_IDR: ${{ vars.KURS_MYR_IDR }}   # opsional: kurs MYR->IDR buatan Anda sendiri (bila situs maskapai tampil ringgit)
+          KURS_SGD_IDR: ${{ vars.KURS_SGD_IDR }}   # opsional: kurs SGD->IDR buatan Anda sendiri
           KURS_USD_IDR: ${{ vars.KURS_USD_IDR }}   # opsional: kurs USD->IDR buatan Anda sendiri (untuk Agoda bila tampil USD); kosong = tidak dikonversi
         run: |
           set -f   # cegah '?' dan '*' pada URL diperlakukan sebagai pola file
