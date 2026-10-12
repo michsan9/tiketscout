@@ -29,8 +29,9 @@ jobs:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_KEY: ${{ secrets.INGEST_KEY }}
           CEK: ${{ github.event.inputs.cek }}
-          TGL_MULAI: ${{ vars.TGL_MULAI }}         # opsional, mis. 2027-02-27 (akhir pekan sebelum cuti); kosong = 2027-03-01
+          TGL_MULAI: ${{ vars.TGL_MULAI }}         # opsional; kosong = 2027-02-26. Bila Anda pernah mengisi variabel ini, hapus atau ganti ke 2027-02-26
           TGL_AKHIR: ${{ vars.TGL_AKHIR }}         # opsional; kosong = 2027-03-31
+          SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 200), lalu hasil dihitung & dikirim sebelum job 240 menit
           OTA_TAMBAHAN: ${{ vars.OTA_TAMBAHAN }}   # opsional: OTA lain, JSON mis. {"namasitus":"https://...{o}...{iso}"} (lihat isi_templat di tiketscout.py)
           OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
           DPS_PKU: ${{ vars.DPS_PKU }}             # opsional: 1 = tambahkan tiket tunggal DPS->PKU (transit dipilihkan OTA)
