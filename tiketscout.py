@@ -8,7 +8,7 @@ ALUR
  3. Setelah semua data terbaca, susun BEBERAPA skenario termurah. Penerbangan lanjutan harus berangkat
     minimal MIN_TRANSIT menit (2 jam) dan maksimal MAX_TRANSIT (12 jam) setelah penerbangan pertama mendarat (zona waktu bandara dihitung).
  4. Travel Singaraja->Denpasar Rp145.000, bus Singaraja->Surabaya Rp250.000 (ditetapkan pengguna).
- Pergi DAN pulang dicari di setiap tanggal (default 1-31 Maret 2027; ubah lewat variabel TGL_MULAI / TGL_AKHIR).
+ Pergi DAN pulang dicari di setiap tanggal (default 26 Feb - 31 Maret 2027; ubah lewat variabel TGL_MULAI / TGL_AKHIR).
 
 PAKAI
     python tiketscout.py once                         # cari semua tanggal, susun skenario, kirim ke dashboard
@@ -24,7 +24,7 @@ from playwright.async_api import async_playwright
 # ============================ KONFIGURASI ============================
 INGEST_URL = os.environ.get("INGEST_URL")          # https://domain/index.php?a=ingest
 INGEST_KEY = os.environ.get("INGEST_KEY")
-TGL_MULAI = dt.date.fromisoformat(os.environ.get("TGL_MULAI") or "2027-03-01")     # bisa diatur, mis. 2027-02-27 (akhir pekan sebelum cuti)
+TGL_MULAI = dt.date.fromisoformat(os.environ.get("TGL_MULAI") or "2027-02-26")     # default 26 Feb 2027; bisa diatur lewat variabel TGL_MULAI
 TGL_AKHIR = dt.date.fromisoformat(os.environ.get("TGL_AKHIR") or "2027-03-31")
 MIN_TRANSIT = 120                                  # menit antara mendarat dan penerbangan berikutnya (minimal 2 jam)
 MAX_TRANSIT = int(os.environ.get("MAX_TRANSIT") or 720)   # singgah > 12 jam dianggap tidak praktis (ubah bila perlu)
@@ -45,7 +45,10 @@ except Exception as e:
 FLIGHT_SITES += [k for k in EXTRA if k not in FLIGHT_SITES]
 NOROUTE = {}     # (situs, asal, tujuan) -> berapa kali kosong; situs maskapai dilewati setelah 2x kosong (maskapai itu tidak terbang di rute tsb)
 OTA_SEMUA = os.environ.get("OTA_SEMUA") == "1"             # 1 = baca SEMUA OTA untuk tiap rute-tanggal lalu gabungkan (lebih lama)
-WORKERS = int(os.environ.get("WORKERS") or 4)
+WORKERS = int(os.environ.get("WORKERS") or 6)
+SOFT_MENIT = int(os.environ.get("SOFT_MENIT") or 200)          # setelah N menit pencarian dihentikan rapi, lalu skenario dihitung & dikirim (batas job GitHub 240 menit)
+CACHE_FILE = os.environ.get("CACHE_FILE") or "kartu_cache.json"   # hasil putaran sebelumnya: tanggal yang belum sempat dibaca tidak hilang
+CACHE_JAM = float(os.environ.get("CACHE_JAM") or 0)          # 0 = TIDAK memakai data lama sama sekali (bawaan). Isi jam bila ingin cadangan dari putaran sebelumnya
 K_SILANG = int(os.environ.get("K_SILANG") or 3)            # cek silang: K tanggal termurah per rute dibaca juga di sumber LAIN (0 = matikan)              # halaman browser paralel
 KURS = {"USD": float(os.environ.get("KURS_USD_IDR") or 0), "MYR": float(os.environ.get("KURS_MYR_IDR") or 0), "SGD": float(os.environ.get("KURS_SGD_IDR") or 0)}   # opsional, diisi SENDIRI bila situs menampilkan mata uang asing
 PROFIL_DIR = os.environ.get("PROFIL_DIR")                  # opsional: profil browser tetap (untuk verifikasi manual di PC sendiri)
@@ -333,8 +336,31 @@ def post(url, payload):
     try: return urllib.request.urlopen(req, timeout=90).read()[:80]
     except Exception as e: print("  kirim gagal:", e, flush=True)
 
+TS_KARTU, BARU, MULAI_RUN = {}, set(), [time.time()]      # TS_KARTU: (o,d,tgl) -> waktu terakhir dibaca; BARU: sudah dibaca ulang di putaran ini
+
+def simpan_cache():
+    try:
+        out = {"|".join(k): {"ts": TS_KARTU.get(k, 0), "cards": list(v.values())} for k, v in CARDS.items() if v}
+        json.dump(out, open(CACHE_FILE, "w", encoding="utf-8"), default=str)
+    except Exception as e: print("  cache gagal disimpan:", str(e)[:80], flush=True)
+
+def muat_cache():
+    n = 0
+    if CACHE_JAM <= 0: return 0
+    try: data = json.load(open(CACHE_FILE, encoding="utf-8"))
+    except Exception: return 0
+    for k, v in data.items():
+        try:
+            o, d, ds = k.split("|"); t = dt.date.fromisoformat(ds)
+            if not (TGL_MULAI <= t <= TGL_AKHIR + dt.timedelta(days=1)) or time.time() - v["ts"] > CACHE_JAM * 3600: continue
+            CARDS[(o, d, ds)] = {(c["dep"], c["dur"], c["maskapai"]): c for c in v["cards"]}; TS_KARTU[(o, d, ds)] = v["ts"]; n += 1
+        except Exception: continue
+    return n
+
 def simpan_kartu(o, d, ds, r):
     kunci = CARDS.setdefault((o, d, ds), {})
+    if (o, d, ds) not in BARU: kunci.clear(); BARU.add((o, d, ds))        # data cache diganti data baru putaran ini
+    TS_KARTU[(o, d, ds)] = time.time()
     for c in r["cards"]:
         k = (c["dep"], c["dur"], c["maskapai"]); c = dict(c, sumber=r["site"], url=r["url"])
         if k not in kunci or c["harga"] < kunci[k]["harga"]: kunci[k] = c
@@ -459,6 +485,7 @@ def tugas_semua():
     return [(o, d, TGL_MULAI + dt.timedelta(days=i)) for i in range(n + 1) for o, d in rute_semua()]
 
 STAT = dict(ok=0, kosong=0)
+LEWAT = [False]
 
 async def proses(page, t):
     o, d, date = t; ds = date.isoformat(); berhasil = False
@@ -474,7 +501,7 @@ async def proses(page, t):
             print(f"  {site:9} {o}->{d} {ds}  {len(r['cards']):>2} kartu | termurah Rp{c['harga']:,} {c['dep']} " +
                   (f"{c['dur'] // 60}j{c['dur'] % 60:02d}m" if c["dur"] else "durasi ?") + f" {c['maskapai'] or ''} {c['transit'] or ''}", flush=True)
             if STAT["ok"] % 40 == 0: status("progres", f"{STAT['ok']} halaman terbaca")
-            if STAT["ok"] % 80 == 0: hitung_dan_kirim()               # dashboard ikut terisi selama proses berjalan
+            if STAT["ok"] % 80 == 0: simpan_cache(); hitung_dan_kirim()               # dashboard ikut terisi selama proses berjalan
             if not OTA_SEMUA: return True
             continue
         if site in LANGSUNG and time.time() >= JEDA.get(site, 0): NOROUTE[(site, o, d)] = NOROUTE.get((site, o, d), 0) + 1; continue      # kosong biasa (maskapai tak terbang di rute ini)
@@ -491,6 +518,9 @@ async def paralel(br, tugas, fn=None):
     async def kerja():
         ctx = await konteks(br); page = await ctx.new_page()
         while True:
+            if time.time() - MULAI_RUN[0] > SOFT_MENIT * 60:
+                if not LEWAT[0]: LEWAT[0] = True; print(f"!! batas waktu lunak {SOFT_MENIT} menit tercapai: sisa pencarian dihentikan (tanggal yang belum terbaca ditandai di log; TIDAK diisi dengan data lama)", flush=True)
+                break
             try: t = q.get_nowait()
             except asyncio.QueueEmpty: break
             await (fn or proses)(page, t); await asyncio.sleep(random.uniform(1.5, 4))
@@ -504,8 +534,24 @@ async def run_once():
         status("gagal", repr(e)[:150]); raise
     status("selesai", f"{STAT['ok']} halaman terbaca, {STAT['kosong']} kosong")
 
+def laporan_tanggal():
+    """Cetak tanggal yang belum punya data sama sekali, per rute (agar tidak ada lompatan tanggal tanpa terlihat)."""
+    kosong = {}
+    for o, d, date in tugas_semua():
+        if not CARDS.get((o, d, date.isoformat())): kosong.setdefault((o, d), []).append(date.strftime("%d/%m"))
+    if not kosong: print("== semua tanggal tiap rute sudah punya data", flush=True); return
+    for (o, d), lst in sorted(kosong.items()): print(f"   belum ada data {o}->{d}: {', '.join(lst)}", flush=True)
+
+def reset_dashboard():
+    """Hapus data lama di dashboard supaya yang tampil hanya hasil putaran ini."""
+    if INGEST_URL and INGEST_KEY:
+        r = post(INGEST_URL.replace("a=ingest", "a=reset"), dict(key=INGEST_KEY))
+        print("   dashboard dikosongkan dari data lama" if r is not None else "   (dashboard belum mendukung a=reset: perbarui index.php)", flush=True)
+
 async def _run_once():
-    CARDS.clear(); tugas = tugas_semua(); per_rute = {}
+    reset_dashboard()
+    CARDS.clear(); MULAI_RUN[0] = time.time(); tugas = tugas_semua(); per_rute = {}
+    print(f"cache putaran sebelumnya: {muat_cache()} rute-tanggal dipakai sebagai cadangan", flush=True)
     for o, d, date in tugas: per_rute.setdefault((o, d), []).append(date)
     print(f"[{dt.datetime.now():%H:%M}] {TGL_MULAI} s/d {TGL_AKHIR}: {len(per_rute)} rute x {len(tugas) // len(per_rute)} tanggal = {len(tugas)} pencarian", flush=True)
     async with async_playwright() as p:
@@ -516,13 +562,17 @@ async def _run_once():
         hidup = {(o, d) for (o, d, ds) in CARDS}
         for o, d in sorted(set(per_rute) - hidup): print(f"  !! rute {o}->{d} tidak terbaca di semua OTA -> dilewati putaran ini", flush=True)
         print("== PENCARIAN: setiap tanggal untuk tiap rute", flush=True)
-        await paralel(br, [t for t in tugas if (t[0], t[1]) in hidup and (t[0], t[1], t[2].isoformat()) not in CARDS])
+        sisa = [t for t in tugas if (t[0], t[1]) in hidup and (t[0], t[1], t[2].isoformat()) not in BARU]
+        sisa.sort(key=lambda t: (((t[2] - TGL_MULAI).days) % 3, t[2], t[0], t[1]))     # tiga gelombang (tiap 3 hari, lalu sisanya) agar kalau terpotong tanggalnya tetap tersebar, bukan berhenti di satu tanggal
+        print(f"   {sum(1 for t in sisa if (t[0], t[1], t[2].isoformat()) not in CARDS)} rute-tanggal belum punya data, {sum(1 for t in sisa if (t[0], t[1], t[2].isoformat()) in CARDS)} diperbarui dari cache", flush=True)
+        await paralel(br, sisa)
+        simpan_cache(); laporan_tanggal()
         hitung_dan_kirim()                                         # skenario sudah bisa dilihat sebelum cek silang selesai
-        if K_SILANG:
+        if K_SILANG and not LEWAT[0]:
             ts = daftar_silang(); print(f"== CEK SILANG: {len(ts)} halaman (sumber lain untuk {K_SILANG} tanggal termurah per rute)", flush=True)
             await paralel(br, ts, proses_silang)
         await br.close()
-    hitung_dan_kirim(tampil=True)
+    simpan_cache(); hitung_dan_kirim(tampil=True)
     print("== SELESAI.", STAT, flush=True)
 
 async def cek(o, d, ds):
