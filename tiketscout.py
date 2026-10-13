@@ -563,6 +563,7 @@ async def _run_once():
             await paralel(br, ts, proses_silang)
         await br.close()
     simpan_cache(); hitung_dan_kirim(tampil=True)
+    if INGEST_URL: print("  notifikasi email:", post(INGEST_URL.replace("a=ingest", "a=notif"), dict(key=INGEST_KEY)), flush=True)      # dashboard memutuskan sendiri apakah ada tiket 3-4 juta yang perlu dikabarkan
     print("== SELESAI.", STAT, flush=True)
 
 async def cek(o, d, ds):
