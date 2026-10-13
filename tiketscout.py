@@ -36,8 +36,8 @@ JALUR = [("DPS", ["DPS", "CGK", "PKU"]), ("DPS", ["DPS", "KUL", "PKU"]), ("DPS",
          ("SUB", ["SUB", "PKU"]),        ("SUB", ["SUB", "KUL", "PKU"]), ("SUB", ["SUB", "SIN", "PKU"])]
 if os.environ.get("DPS_PKU") == "1":               # opsional: tiket tunggal DPS->PKU (OTA memilihkan transitnya)
     JALUR.append(("DPS", ["DPS", "PKU"]))
-FLIGHT_SITES = ["trip", "tiket", "agoda", "google", "traveloka", "airasia", "batikair", "scoot"]   # cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
-LANGSUNG = {"batikair", "scoot"}     # situs MASKAPAI: hanya menjual penerbangan sendiri -> pembanding (cek silang / OTA_SEMUA), bukan cadangan cascade
+FLIGHT_SITES = ["trip", "agoda", "google"]   # hanya 3 sumber yang terbaca dari server; cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
+LANGSUNG = set()     # tidak ada situs maskapai langsung lagi (Batik Air/Scoot/AirAsia dihapus: diblokir verifikasi)
 try:   # sumber tambahan tanpa ubah kode: {"namasitus": "https://...{o}...{iso}"}  (isi dari URL hasil pencarian di browser Anda)
     EXTRA = {k: v for k, v in json.loads(os.environ.get("OTA_TAMBAHAN") or "{}").items() if re.fullmatch(r"[a-z0-9]+", k) and str(v).startswith("https://")}
 except Exception as e:
@@ -59,10 +59,6 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 # ============================ URL PENCARIAN ============================
 TRIP_ID = {"DPS": 723, "PKU": 5604}                # id kota Trip.com yang diketahui (dari URL contoh)
 
-# tiket.com memakai kode KOTA (akhiran C), bukan kode bandara: Denpasar=DPSC, Kuala Lumpur=KULC; Jakarta=JKTC (bukan CGK)
-TIKET_KOTA = {"DPS": ("DPSC", "Denpasar-Bali"), "SUB": ("SUBC", "Surabaya"), "CGK": ("JKTC", "Jakarta"), "KUL": ("KULC", "Kuala Lumpur"),
-              "SIN": ("SINC", "Singapura"), "PKU": ("PKUC", "Pekanbaru")}
-
 BLN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 def tgl_txt(date):                                   # 10 Oct 2026 -> 10%20Oct%202026
@@ -78,30 +74,16 @@ def isi_templat(t, o, d, date):
 def flight_url(site, o, d, date):
     if site in EXTRA: return isi_templat(EXTRA[site], o, d, date)
     iso, dmy, dmy2 = date.isoformat(), date.strftime("%d-%m-%Y"), date.strftime("%d/%m/%Y")
-    if site == "batikair":       # flights.batikair.com: Jtype=1 (sekali jalan; contoh pengguna memakai Jtype=2 untuk pulang-pergi) - uji dengan 'cek'
-        e = date.strftime("%d%%2F%m%%2F%Y")
-        return (f"https://flights.batikair.com/default.aspx?aid=231&Jtype=1&depCity={o}&arrCity={d}&depDate={e}&arrDate={e}&currency=&adult1=1&child1=0&infant1=0"
-                "&culture=en-GB&df=UK&afid=0&b2b=0&St=fa&DFlight=false&roomcount=1")
-    if site == "scoot":          # booking.flyscoot.com: format 'return' dari contoh pengguna; tanggal pulang = berangkat + 7 hari (hanya daftar penerbangan pergi yang dibaca)
-        return (f"https://booking.flyscoot.com/book/flight/return/{o}/{tgl_txt(date)}/{d}/{d}/{tgl_txt(date + dt.timedelta(days=7))}/{o}"
-                "?adult=1&child=0&infant=0&cur=IDR&culture=en-sg")
     if site == "trip":
         u = f"https://id.trip.com/flights/showfarefirst?dcity={o.lower()}&acity={d.lower()}&ddate={iso}"
         if o in TRIP_ID: u += f"&dcityid={TRIP_ID[o]}"
         if d in TRIP_ID: u += f"&acityid={TRIP_ID[d]}"
         return u + "&triptype=ow&class=y&lowpricesource=searchform&quantity=1&searchboxarg=t&nonstoponly=off&locale=id-ID&curr=IDR"
-    if site == "tiket":          # format dari URL contoh pengguna (id-id/flights/search, kode kota + akhiran C)
-        (oc, ol), (dc, dl) = TIKET_KOTA[o], TIKET_KOTA[d]
-        return (f"https://www.tiket.com/id-id/flights/search?d={oc}&a={dc}&date={iso}&adult=1&child=0&infant=0&class=economy"
-                f"&dType=CITY&aType=CITY&dLabel={quote(ol)}&aLabel={quote(dl)}&type=depart&flexiFare=true")
     if site == "google":
         return "https://www.google.com/travel/flights?q=" + quote(f"Flights from {o} to {d} on {iso} one way") + "&curr=IDR&hl=id"
     return {
         "agoda": (f"https://www.agoda.com/id-id/flights/results?departureFrom={o}&departureFromType=1&arrivalTo={d}&arrivalToType=1"
                   f"&departDate={iso}&adults=1&children=0&infants=0&cabinType=Economy&tripType=OneWay&currencyCode=IDR&currency=IDR"),
-        "traveloka": f"https://www.traveloka.com/id-id/flight/fullsearch?ap={o}.{d}&dt={dmy}.null&ps=1.0.0&sc=ECONOMY",
-        "airasia": (f"https://www.airasia.com/flights/search/?origin={o}&destination={d}&departDate={dmy2}"
-                    "&tripType=O&adult=1&child=0&infant=0&locale=id-id&currency=IDR"),
     }[site]
 
 # ============================ MEMBACA KARTU HASIL ============================
@@ -113,7 +95,7 @@ STOPS_RE = re.compile(r"langsung|non-?stop|direct|\d+\s*(?:transit|stops?|pember
 BANNER_RE = re.compile(r"turun|di ?bawah|notifikasi|mengabari|penawaran|alert|below|cashback|hemat|potongan|voucher|kupon|coupon|bonus|poin|points", re.I)
 FILTER_RE = re.compile(r"waktu (?:kedatangan|keberangkatan)|durasi (?:transit|perjalanan)|kota transit|harga per orang|hingga usd|rentang harga|disarankan"
                        r"|00[:.]00\s*[\u2013-]\s*(?:24[:.]00|23[:.]59)|\d+j(?:\s*\d+m)?\s*[\u2013-]\s*\d+j", re.I)
-BOT_RE = re.compile(r"human verification|confirm you are human|verifikasi keamanan|security check|captcha|are you a robot|just a moment|tunggu sebentar|access denied|unusual traffic|cloudflare", re.I)
+BOT_RE = re.compile(r"human verification|confirm you are human|verifikasi keamanan|security check|captcha|are you a robot|just a moment|tunggu sebentar|access denied|unusual traffic|cloudflare|robot atau manusia|verifikasi bahwa anda adalah manusia|melakukan verifikasi keamanan|verifikasi keamanan|unable to proceed for security", re.I)
 AIRLINES = ["Batik Air Malaysia", "Batik Air", "Malaysia Airlines", "Lion Air", "Super Air Jet", "Citilink", "Garuda Indonesia", "Garuda",
             "Pelita Air", "AirAsia", "TransNusa", "Wings Air", "Scoot", "Singapore Airlines", "Sriwijaya", "Jetstar", "Malindo"]
 
@@ -633,7 +615,7 @@ async def login():
     PROFIL_DIR = PROFIL_DIR or os.path.abspath("profil_browser"); HEADLESS = False
     async with async_playwright() as p:
         br = await peluncur(p); ctx = await konteks(br)
-        for site in ("traveloka", "airasia"):
+        for site in ("agoda", "trip"):
             pg = await ctx.new_page(); await pg.goto(flight_url(site, "DPS", "CGK", TGL_MULAI), wait_until="domcontentloaded")
         print(f"\nSelesaikan verifikasi manusia di tiap tab (klik 'Begin'/centang) lalu tekan Enter di sini. Profil: {PROFIL_DIR}", flush=True)
         await asyncio.get_event_loop().run_in_executor(None, input, "Tekan Enter bila selesai... ")
