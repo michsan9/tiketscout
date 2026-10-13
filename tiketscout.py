@@ -36,7 +36,7 @@ JALUR = [("DPS", ["DPS", "CGK", "PKU"]), ("DPS", ["DPS", "KUL", "PKU"]), ("DPS",
          ("SUB", ["SUB", "PKU"]),        ("SUB", ["SUB", "KUL", "PKU"]), ("SUB", ["SUB", "SIN", "PKU"])]
 if os.environ.get("DPS_PKU") == "1":               # opsional: tiket tunggal DPS->PKU (OTA memilihkan transitnya)
     JALUR.append(("DPS", ["DPS", "PKU"]))
-FLIGHT_SITES = ["trip", "agoda", "google", "traveloka", "airasia", "batikair", "scoot"]   # cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
+FLIGHT_SITES = ["trip", "tiket", "agoda", "google", "traveloka", "airasia", "batikair", "scoot"]   # cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
 LANGSUNG = {"batikair", "scoot"}     # situs MASKAPAI: hanya menjual penerbangan sendiri -> pembanding (cek silang / OTA_SEMUA), bukan cadangan cascade
 try:   # sumber tambahan tanpa ubah kode: {"namasitus": "https://...{o}...{iso}"}  (isi dari URL hasil pencarian di browser Anda)
     EXTRA = {k: v for k, v in json.loads(os.environ.get("OTA_TAMBAHAN") or "{}").items() if re.fullmatch(r"[a-z0-9]+", k) and str(v).startswith("https://")}
@@ -58,6 +58,10 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 
 # ============================ URL PENCARIAN ============================
 TRIP_ID = {"DPS": 723, "PKU": 5604}                # id kota Trip.com yang diketahui (dari URL contoh)
+
+# tiket.com memakai kode KOTA (akhiran C), bukan kode bandara: Denpasar=DPSC, Kuala Lumpur=KULC; Jakarta=JKTC (bukan CGK)
+TIKET_KOTA = {"DPS": ("DPSC", "Denpasar-Bali"), "SUB": ("SUBC", "Surabaya"), "CGK": ("JKTC", "Jakarta"), "KUL": ("KULC", "Kuala Lumpur"),
+              "SIN": ("SINC", "Singapura"), "PKU": ("PKUC", "Pekanbaru")}
 
 BLN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -86,6 +90,10 @@ def flight_url(site, o, d, date):
         if o in TRIP_ID: u += f"&dcityid={TRIP_ID[o]}"
         if d in TRIP_ID: u += f"&acityid={TRIP_ID[d]}"
         return u + "&triptype=ow&class=y&lowpricesource=searchform&quantity=1&searchboxarg=t&nonstoponly=off&locale=id-ID&curr=IDR"
+    if site == "tiket":          # format dari URL contoh pengguna (id-id/flights/search, kode kota + akhiran C)
+        (oc, ol), (dc, dl) = TIKET_KOTA[o], TIKET_KOTA[d]
+        return (f"https://www.tiket.com/id-id/flights/search?d={oc}&a={dc}&date={iso}&adult=1&child=0&infant=0&class=economy"
+                f"&dType=CITY&aType=CITY&dLabel={quote(ol)}&aLabel={quote(dl)}&type=depart&flexiFare=true")
     if site == "google":
         return "https://www.google.com/travel/flights?q=" + quote(f"Flights from {o} to {d} on {iso} one way") + "&curr=IDR&hl=id"
     return {
