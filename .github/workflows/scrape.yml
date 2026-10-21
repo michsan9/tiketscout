@@ -50,6 +50,7 @@ jobs:
             cek_*.png
             teks_*.txt
           if-no-files-found: ignore
+          retention-days: 3              # hapus otomatis setelah 3 hari agar kuota penyimpanan GitHub tidak penuh (bawaan 90 hari)
       - name: Jaga jadwal tetap aktif (GitHub menonaktifkan cron repo publik setelah 60 hari tanpa aktivitas)
         if: always()
         continue-on-error: true
