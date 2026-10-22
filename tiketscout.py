@@ -96,7 +96,7 @@ PRICE_RE = re.compile(r"(?:Rp|IDR)[\s\xa0]*([\d]{1,3}(?:[.,]\d{3})+)", re.I)
 CUR_RE = re.compile(r"\b(USD|MYR|SGD|RM)[\s\xa0]*\$?[\s\xa0]*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)")
 TIME_RE = re.compile(r"(?<![\d.,])(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)")                 # 12:25 / 12.25 / 5.20
 DUR_RE = re.compile(r"(\d{1,3})\s*(?:jam|j|h|hrs?|hours?)(?![a-z])(?:\s*(\d{1,2})\s*(?:menit|mnt|m|mins?|minutes?)(?![a-z]))?", re.I)
-STOPS_RE = re.compile(r"langsung|non-?stop|direct|\d+\s*(?:transit|stops?|pemberhentian)", re.I)
+STOPS_RE = re.compile(r"langsung|non-?stop|direct|\d+\s*(?:kali\s+)?(?:transit|stops?|pemberhentian)", re.I)
 BANNER_RE = re.compile(r"turun|di ?bawah|notifikasi|mengabari|penawaran|alert|below|cashback|hemat|potongan|voucher|kupon|coupon|bonus|poin|points", re.I)
 FILTER_RE = re.compile(r"waktu (?:kedatangan|keberangkatan)|durasi (?:transit|perjalanan)|kota transit|harga per orang|hingga usd|rentang harga|disarankan"
                        r"|00[:.]00\s*[\u2013-]\s*(?:24[:.]00|23[:.]59)|\d+j(?:\s*\d+m)?\s*[\u2013-]\s*\d+j", re.I)
@@ -281,18 +281,40 @@ async def tunggu_hasil(page, maks=None):
         except Exception: pass
     return text, []
 
-async def muat_lebih(page, cards):
+def ada_transit_kota(cards, d):
+    """Sudah ada kartu 1-transit di kota transit (mis. KUL) untuk tiket o->d (d = kota lebih jauh, mis. SIN)?"""
+    kota = [k for k, bs in HIDDEN.items() if d in bs]
+    return any(c.get("transit") and c["transit"].startswith("1") and any(k in (c.get("via") or []) for k in kota) for c in cards)
+
+async def muat_lebih(page, cards, d=None):
     """Hasil OTA sering dimuat bertahap: scroll ke bawah dan klik 'Lihat lebih banyak' (seperti pengguna) sampai kartu tidak bertambah."""
-    for _ in range(3):
+    cari = bool(d and HIDDEN and any(d in bs for bs in HIDDEN.values())); diam = 0
+    for _ in range(16 if cari else 8):
         try:
+            for _k in range(4): await page.mouse.wheel(0, 1500); await page.wait_for_timeout(500)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.get_by_role("button", name=re.compile(r"lihat lebih banyak|tampilkan lebih banyak|penerbangan lainnya|lihat semua|muat lebih|more flights|show more|load more", re.I)).first.click(timeout=1200)
         except Exception: pass
         await page.wait_for_timeout(2000)
         try: baru = await ambil_kartu(page, await page.inner_text("body"))
         except Exception: break
-        if len(baru) <= len(cards): break
+        if len(baru) <= len(cards):
+            diam += 1                                   # tidak bertambah: bila tiket 1-transit-KUL belum ketemu, coba sekali lagi sebelum menyerah
+            if not cari or ada_transit_kota(cards, d) or diam >= 3: break
+            continue
         cards = baru
+        if cari and ada_transit_kota(cards, d) and _ >= 4: break
+    return cards
+
+async def urut_termurah(page, cards):
+    """Trip.com memuat daftar bertahap menurut 'Direkomendasikan' (ratusan opsi, hanya sebagian termuat). Klik tab 'Termurah' seperti pengguna
+    agar yang termuat adalah opsi TERMURAH (termasuk AirAsia transit KUL yang dipakai skema turun-di-transit)."""
+    try:
+        await page.get_by_text(re.compile(r"^\s*Termurah\b", re.I)).first.click(timeout=2500)
+        await page.wait_for_timeout(4000)
+        baru = await ambil_kartu(page, await page.inner_text("body"))
+        if baru: return baru
+    except Exception as e: print("     trip: tab 'Termurah' tidak bisa diklik:", str(e)[:60], flush=True)
     return cards
 
 GAGAL, JEDA = {}, {}
@@ -311,7 +333,8 @@ async def baca(page, site, o, d, date):
     await page.goto(flight_url(site, o, d, date), wait_until="domcontentloaded", timeout=60000)
     if site == "google": await tutup_consent(page)
     text, cards = await tunggu_hasil(page)
-    if cards: cards = await muat_lebih(page, cards)
+    if cards and site == "trip": cards = await urut_termurah(page, cards)
+    if cards: cards = await muat_lebih(page, cards, d if site == "trip" else None)
     if len(text) < 2500 and BOT_RE.search(text):
         print(f"     {site}: isi halaman: {re.sub(chr(10), ' ', text[:160])!r}", flush=True)
         print(f"     {site}: halaman VERIFIKASI ANTI-BOT -> situs dilewati 6 jam (tidak ditembus; lihat 'login' untuk verifikasi manual di PC sendiri)", flush=True)
@@ -623,7 +646,10 @@ async def cek(o, d, ds):
             if r:
                 for c in sorted(r["cards"], key=lambda x: x["harga"])[:8]:
                     print(f"      Rp{c['harga']:>10,} | {c['dep']}->{c['arr']} | " + (f"{c['dur'] // 60}j{c['dur'] % 60:02d}m" if c["dur"] else "durasi ?") +
-                          f" | {c['maskapai'] or '-'} | {c['transit'] or '-'}", flush=True)
+                          f" | {c['maskapai'] or '-'} | {c['transit'] or '-'} | via={','.join(c.get('via') or []) or '-'} leg1={c.get('leg1') or '-'}", flush=True)
+                s1 = [c for c in r["cards"] if c.get("transit") and c["transit"].startswith("1")]
+                print(f"      kartu 1-transit: {len(s1)} dari {len(r['cards'])}; kota transit terbaca: {sum(1 for c in s1 if c.get('via'))}", flush=True)
+                for c in sorted(s1, key=lambda x: x["harga"])[:4]: print(f"         1-transit Rp{c['harga']:,} {c['dep']} {c['maskapai']}: {c['bukti'][:140]}", flush=True)
                 print(f"      teks kartu termurah: {min(r['cards'], key=lambda x: x['harga'])['bukti']}", flush=True)
                 simpan_kartu(o, d, ds, r)
                 c = min(r["cards"], key=lambda x: x["harga"])
