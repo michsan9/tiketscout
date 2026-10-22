@@ -1,0 +1,47 @@
+# Simpan sebagai: .github/workflows/bersihkan.yml
+# Menghapus workflow run dan artifact yang umurnya lebih dari 1 hari (kecuali yang sedang berjalan).
+name: bersihkan-run
+on:
+  schedule:
+    - cron: '17 */6 * * *'        # tiap 6 jam (UTC)
+  workflow_dispatch: {}            # bisa dijalankan manual dari tab Actions
+concurrency:
+  group: bersihkan-run
+  cancel-in-progress: false
+permissions:
+  actions: write
+  contents: read
+jobs:
+  bersihkan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      HARI: '1'                    # simpan berapa hari
+    steps:
+      - name: Hapus run lama
+        run: |
+          set -u
+          BATAS=$(date -u -d "${HARI} day ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Menghapus run yang dibuat sebelum $BATAS (kecuali yang sedang berjalan)"
+          gh api --paginate "repos/$REPO/actions/runs?per_page=100" \
+            --jq ".workflow_runs[] | select(.status==\"completed\" and .created_at < \"$BATAS\") | .id" > ids.txt || true
+          n=0
+          while read -r id; do
+            [ -z "$id" ] && continue
+            gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && n=$((n+1)) || echo "gagal hapus run $id"
+          done < ids.txt
+          echo "Run terhapus: $n"
+      - name: Hapus artifact lama
+        run: |
+          set -u
+          BATAS=$(date -u -d "${HARI} day ago" +%Y-%m-%dT%H:%M:%SZ)
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.created_at < \"$BATAS\") | .id" > art.txt || true
+          n=0
+          while read -r id; do
+            [ -z "$id" ] && continue
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1 && n=$((n+1)) || echo "gagal hapus artifact $id"
+          done < art.txt
+          echo "Artifact terhapus: $n"
