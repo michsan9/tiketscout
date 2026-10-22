@@ -41,7 +41,6 @@ if os.environ.get("DPS_PKU") == "1":               # opsional: tiket tunggal DPS
 HIDDEN = {}
 for _p in (os.environ.get("HIDDEN_VIA") or "KUL>SIN").split(","):
     if ">" in _p: _a, _b = _p.strip().upper().split(">", 1); HIDDEN.setdefault(_a, []).append(_b)
-EST_DUR = {("DPS", "KUL"): 190, ("SUB", "KUL"): 160, ("DPS", "CGK"): 165, ("SUB", "CGK"): 105, ("DPS", "SIN"): 170, ("SUB", "SIN"): 150}   # menit, PERKIRAAN lama terbang ruas pertama (data OTA hanya memberi total sampai kota tiket)
 FLIGHT_SITES = ["trip", "agoda", "google"]   # hanya 3 sumber yang terbaca dari server; cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
 LANGSUNG = set()     # tidak ada situs maskapai langsung lagi (Batik Air/Scoot/AirAsia dihapus: diblokir verifikasi)
 try:   # sumber tambahan tanpa ubah kode: {"namasitus": "https://...{o}...{iso}"}  (isi dari URL hasil pencarian di browser Anda)
@@ -129,6 +128,10 @@ def maskapai(t):
             if best is None or x.start() < best[0] or (x.start() == best[0] and len(n) > len(best[1])): best = (x.start(), n)
     return ALIAS.get(best[1], best[1]) if best else None
 
+TRANSIT_DI_RE = re.compile(r"(?:transit|layover)\s+(?:di|in|at)\s+([A-Za-z][A-Za-z .'-]{2,30}?)(?=\s*\d+\s*(?:j|h|jam|hr)\b)", re.I)
+KOTA_TR = r"(?:Kuala\s*Lumpur|Jakarta|Singapura|Singapore|Surabaya|Denpasar|Bali|Bangkok|Batam|Medan|Pekanbaru|Johor\s*Bahru|Penang|Hong\s*Kong|Manila|Ho\s*Chi\s*Minh|Jeddah|Doha|Dubai)"
+LAY_DI_RE = re.compile(r"\d+\s*(?:j|h)(?:\s*\d+\s*(?:m|mnt|menit))?\s+di\s+(" + KOTA_TR + r")", re.I)      # kartu ringkas: '2j 10m di Kuala Lumpur'
+LEG1_RE = re.compile(r"(?:durasi penerbangan|flight duration)\s*:?\s*(\d{1,2})\s*(?:j|h|jam|hr)s?\s*(?:(\d{1,2})\s*(?:m|mnt|menit|min)\w*)?", re.I)
 VIA_RE = {"KUL": re.compile(r"\bKUL\b|Kuala\s*Lumpur", re.I), "CGK": re.compile(r"\bCGK\b|Jakarta|Soekarno", re.I), "SIN": re.compile(r"\bSIN\b|Singapura|Singapore", re.I)}
 
 def kartu(t):
@@ -150,8 +153,11 @@ def kartu(t):
     dur = adj[-1] if adj else (max(d for e, d in durs) if durs else None)
     sm = list(STOPS_RE.finditer(t))
     via = [k for k, rx in VIA_RE.items() if rx.search(t)]
-    return dict(via=via, harga=min(harga), dep=jam(times[0].group(0)), arr=jam(times[1].group(0)), dur=dur, maskapai=maskapai(t),
-                transit=sm[-1].group(0).strip().capitalize() if sm else None, bukti=re.sub(r"\s+", " ", t).strip()[:170])
+    kota_tr = {re.sub(r"\s+", " ", x).strip().lower() for x in TRANSIT_DI_RE.findall(t) + LAY_DI_RE.findall(t)}      # 'Transit di Kuala Lumpur 1j 5m' (tidak ada angka 'N transit')
+    tr = ("%d transit" % len(kota_tr)) if kota_tr else (sm[-1].group(0).strip().capitalize() if sm else None)
+    l1 = LEG1_RE.search(t); leg1 = (int(l1.group(1)) * 60 + int(l1.group(2) or 0)) if l1 else None   # 'Durasi penerbangan: 3j 5m' pertama = ruas pertama
+    return dict(via=via, leg1=leg1, harga=min(harga), dep=jam(times[0].group(0)), arr=jam(times[1].group(0)), dur=dur, maskapai=maskapai(t),
+                transit=tr, bukti=re.sub(r"\s+", " ", t).strip()[:170])
 
 def cocokkan(c, o, d):
     """Verifikasi silang kartu: berangkat + durasi harus = jam tiba (selisih zona waktu o->d dihitung).
@@ -405,15 +411,20 @@ def rakit(arah, gateway, ap, penerbangan):
     return dict(arah=arah, jalur="-".join(seq), tgl=penerbangan[0][2].isoformat(), total=total, waktu=waktu, layover=lay_min, data=dict(legs=legs))
 
 def kartu_hidden(o, kota, d):
-    """Kartu o->(kota lebih jauh) yang transit 1x di `kota`: dipakai sebagai tiket o->kota (turun di transit, tidak lanjut)."""
+    """Kartu o->(kota lebih jauh) yang transit 1x di `kota`: dipakai sebagai tiket o->kota (turun di transit, tidak lanjut).
+    HANYA dari data yang terbaca di hasil: kota transit harus tertulis di kartu DAN durasi ruas pertama harus terbaca. Tanpa itu kartu dilewati (tidak ada tebakan)."""
     out = []
     for beyond in HIDDEN.get(kota, []):
         for c in kartu_untuk(o, beyond, d):
-            if kota not in (c.get("via") or []) or beyond in ("",) or not c.get("transit") or not re.match(r"\s*1\b", c["transit"]): continue
-            est = EST_DUR.get((o, kota))
-            if not est: continue
-            tiba = utc(o, d, c["dep"]) + dt.timedelta(minutes=est); lok = tiba + dt.timedelta(hours=TZ[kota])
-            out.append(dict(c, dur=est, arr=lok.strftime("%H:%M"), hidden=beyond, transit="Turun di %s (tiket s.d. %s)" % (kota, beyond)))
+            if not c.get("transit") or not re.match(r"\s*1\b", c["transit"]): continue
+            if c.get("sumber") != "trip" or kota not in (c.get("via") or []): continue      # khusus Trip.com
+            leg1 = c.get("leg1")
+            if not leg1:      # kartu ringkas tidak memuat durasi ruas pertama: ambil dari kartu o->kota yang TERBACA, penerbangan sama (jam berangkat sama, maskapai sama bila tertulis)
+                dr = [x for x in kartu_untuk(o, kota, d) if x["dep"] == c["dep"] and x.get("dur") and (not x.get("maskapai") or not c.get("maskapai") or x["maskapai"] == c["maskapai"])]
+                if not dr: continue
+                leg1 = dr[0]["dur"]
+            tiba = utc(o, d, c["dep"]) + dt.timedelta(minutes=leg1); lok = tiba + dt.timedelta(hours=TZ[kota])
+            out.append(dict(c, dur=leg1, arr=lok.strftime("%H:%M"), hidden=beyond, transit="Turun di %s (tiket s.d. %s)" % (kota, beyond)))
     return sorted(out, key=lambda x: x["harga"])
 
 def semua_skenario(arah, hidden=False):
@@ -520,6 +531,10 @@ async def proses(page, t):
                                                           bukti=c["bukti"], url=r["url"], stops=c["transit"], site=site)]))
             print(f"  {site:9} {o}->{d} {ds}  {len(r['cards']):>2} kartu | termurah Rp{c['harga']:,} {c['dep']} " +
                   (f"{c['dur'] // 60}j{c['dur'] % 60:02d}m" if c["dur"] else "durasi ?") + f" {c['maskapai'] or ''} {c['transit'] or ''}", flush=True)
+            if HIDDEN and any(b == d for bs in HIDDEN.values() for b in bs) and o in ("DPS", "SUB"):
+                s1 = [x for x in r["cards"] if x.get("transit") and re.match(r"\s*1\b", x["transit"])]
+                print(f"    [hidden-diag] {o}->{d} {ds}: {len(s1)} kartu 1-transit, kota transit tertulis: {sum(1 for x in s1 if x.get('via') and any(v not in (d,) for v in x['via']))}"
+                      + (f" | contoh: {min(s1, key=lambda x: x['harga'])['bukti'][:150]}" if s1 else ""), flush=True)
             if STAT["ok"] % 40 == 0: status("progres", f"{STAT['ok']} halaman terbaca")
             if STAT["ok"] % 80 == 0: simpan_cache(); hitung_dan_kirim()               # dashboard ikut terisi selama proses berjalan
             if not OTA_SEMUA: return True
