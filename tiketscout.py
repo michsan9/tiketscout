@@ -36,6 +36,12 @@ JALUR = [("DPS", ["DPS", "CGK", "PKU"]), ("DPS", ["DPS", "KUL", "PKU"]), ("DPS",
          ("SUB", ["SUB", "PKU"]),        ("SUB", ["SUB", "KUL", "PKU"]), ("SUB", ["SUB", "SIN", "PKU"])]
 if os.environ.get("DPS_PKU") == "1":               # opsional: tiket tunggal DPS->PKU (OTA memilihkan transitnya)
     JALUR.append(("DPS", ["DPS", "PKU"]))
+# "Turun di transit" (hidden city): tiket ke kota LEBIH JAUH yang transit di kota tujuan kita (mis. DPS->SIN via KUL, lebih murah dari DPS->KUL langsung).
+# Format env HIDDEN_VIA: "KUL>SIN,KUL>BKK" (transit>kota-tujuan-tiket). Kosongkan ("0") untuk mematikan. Hanya untuk tiket SEKALI JALAN penerbangan PERGI.
+HIDDEN = {}
+for _p in (os.environ.get("HIDDEN_VIA") or "KUL>SIN").split(","):
+    if ">" in _p: _a, _b = _p.strip().upper().split(">", 1); HIDDEN.setdefault(_a, []).append(_b)
+EST_DUR = {("DPS", "KUL"): 190, ("SUB", "KUL"): 160, ("DPS", "CGK"): 165, ("SUB", "CGK"): 105, ("DPS", "SIN"): 170, ("SUB", "SIN"): 150}   # menit, PERKIRAAN lama terbang ruas pertama (data OTA hanya memberi total sampai kota tiket)
 FLIGHT_SITES = ["trip", "agoda", "google"]   # hanya 3 sumber yang terbaca dari server; cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
 LANGSUNG = set()     # tidak ada situs maskapai langsung lagi (Batik Air/Scoot/AirAsia dihapus: diblokir verifikasi)
 try:   # sumber tambahan tanpa ubah kode: {"namasitus": "https://...{o}...{iso}"}  (isi dari URL hasil pencarian di browser Anda)
@@ -123,6 +129,8 @@ def maskapai(t):
             if best is None or x.start() < best[0] or (x.start() == best[0] and len(n) > len(best[1])): best = (x.start(), n)
     return ALIAS.get(best[1], best[1]) if best else None
 
+VIA_RE = {"KUL": re.compile(r"\bKUL\b|Kuala\s*Lumpur", re.I), "CGK": re.compile(r"\bCGK\b|Jakarta|Soekarno", re.I), "SIN": re.compile(r"\bSIN\b|Singapura|Singapore", re.I)}
+
 def kartu(t):
     """Teks SATU kartu hasil -> dict(harga, dep, arr, dur, maskapai, transit, bukti) atau None.
     Kartu valid: >=2 jam tayang (berangkat, tiba) + harga. Panel filter/slider & harga di banner notifikasi ditolak."""
@@ -141,7 +149,8 @@ def kartu(t):
     adj = [d for e, d in durs if STOPS_RE.match(t[e:e + 16].lstrip())]                # durasi TOTAL = yang tepat diikuti 'Langsung/N transit'
     dur = adj[-1] if adj else (max(d for e, d in durs) if durs else None)
     sm = list(STOPS_RE.finditer(t))
-    return dict(harga=min(harga), dep=jam(times[0].group(0)), arr=jam(times[1].group(0)), dur=dur, maskapai=maskapai(t),
+    via = [k for k, rx in VIA_RE.items() if rx.search(t)]
+    return dict(via=via, harga=min(harga), dep=jam(times[0].group(0)), arr=jam(times[1].group(0)), dur=dur, maskapai=maskapai(t),
                 transit=sm[-1].group(0).strip().capitalize() if sm else None, bukti=re.sub(r"\s+", " ", t).strip()[:170])
 
 def cocokkan(c, o, d):
@@ -387,7 +396,7 @@ def rakit(arah, gateway, ap, penerbangan):
         tiba_lokal = tiba + dt.timedelta(hours=TZ[d])
         legs.append(dict(t="terbang", dari=o, ke=d, tgl=tgl.isoformat(), dep=c["dep"], arr=tiba_lokal.strftime("%H:%M"),
                          hari=(tiba_lokal.date() - tgl).days, menit=c["dur"], harga=c["harga"], maskapai=c["maskapai"], transit=c["transit"],
-                         sumber=c["sumber"], url=c["url"]))
+                         sumber=c["sumber"], url=c["url"], hidden=c.get("hidden")))
         total += c["harga"]; prev_tiba = tiba
     if arah == "pulang": legs.append(darat)
     t0, t1 = utc(penerbangan[0][0], penerbangan[0][2], penerbangan[0][3]["dep"]), prev_tiba
@@ -395,16 +404,29 @@ def rakit(arah, gateway, ap, penerbangan):
     seq = ap if arah == "pergi" else ap[::-1]
     return dict(arah=arah, jalur="-".join(seq), tgl=penerbangan[0][2].isoformat(), total=total, waktu=waktu, layover=lay_min, data=dict(legs=legs))
 
-def semua_skenario(arah):
+def kartu_hidden(o, kota, d):
+    """Kartu o->(kota lebih jauh) yang transit 1x di `kota`: dipakai sebagai tiket o->kota (turun di transit, tidak lanjut)."""
+    out = []
+    for beyond in HIDDEN.get(kota, []):
+        for c in kartu_untuk(o, beyond, d):
+            if kota not in (c.get("via") or []) or beyond in ("",) or not c.get("transit") or not re.match(r"\s*1\b", c["transit"]): continue
+            est = EST_DUR.get((o, kota))
+            if not est: continue
+            tiba = utc(o, d, c["dep"]) + dt.timedelta(minutes=est); lok = tiba + dt.timedelta(hours=TZ[kota])
+            out.append(dict(c, dur=est, arr=lok.strftime("%H:%M"), hidden=beyond, transit="Turun di %s (tiket s.d. %s)" % (kota, beyond)))
+    return sorted(out, key=lambda x: x["harga"])
+
+def semua_skenario(arah, hidden=False):
     """Untuk tiap jalur & tanggal: gabungkan kartu; penerbangan lanjutan wajib berangkat >= MIN_TRANSIT menit setelah mendarat.
     Simpan 2 termurah per (jalur, tanggal)."""
     hasil = []
     for gateway, ap in JALUR:
+        if hidden and not (len(ap) == 3 and ap[1] in HIDDEN): continue
         seq = ap if arah == "pergi" else ap[::-1]; pasang = list(zip(seq, seq[1:]))
         for i in range((TGL_AKHIR - TGL_MULAI).days + 1):
             d1 = TGL_MULAI + dt.timedelta(days=i); cand = []
             o1, h1 = pasang[0]
-            for c1 in kartu_untuk(o1, h1, d1):
+            for c1 in (kartu_hidden(o1, h1, d1) if hidden else kartu_untuk(o1, h1, d1)):
                 if len(pasang) == 1: cand.append(rakit(arah, gateway, ap, [(o1, h1, d1, c1)])); continue
                 if not (c1["dur"] or c1["arr"]): continue
                 tiba1, (o2, h2) = tiba_utc(o1, h1, d1, c1), pasang[1]
@@ -414,6 +436,8 @@ def semua_skenario(arah):
                         if MIN_TRANSIT <= int((utc(o2, d2, c2["dep"]) - tiba1).total_seconds() // 60) <= MAX_TRANSIT:
                             cand.append(rakit(arah, gateway, ap, [(o1, h1, d1, c1), (o2, h2, d2, c2)]))
             cand.sort(key=lambda r: (r["total"], r["waktu"])); hasil += cand[:2]
+    if hidden:
+        for r in hasil: r["arah"] = "turun"
     return hasil
 
 def hitung_dan_kirim(tampil=False):
@@ -421,6 +445,9 @@ def hitung_dan_kirim(tampil=False):
     for arah in ("pergi", "pulang"):
         rows = semua_skenario(arah); ringkas[arah] = rows
         post(INGEST_URL.replace("a=ingest", "a=skenario") if INGEST_URL else None, dict(key=INGEST_KEY, arah=arah, rows=rows))
+    if HIDDEN:
+        rows = semua_skenario("pergi", hidden=True); ringkas["turun"] = rows
+        post(INGEST_URL.replace("a=ingest", "a=skenario") if INGEST_URL else None, dict(key=INGEST_KEY, arah="turun", rows=rows))
     if tampil:
         for arah, rows in ringkas.items():
             print(f"\n== {len(rows)} skenario {arah}; 5 termurah:", flush=True)
@@ -468,6 +495,9 @@ def rute_semua():
     s = set()
     for _, ap in JALUR:
         for seq in (ap, ap[::-1]): s.update(zip(seq, seq[1:]))
+    for kota, bs in HIDDEN.items():
+        for b in bs:
+            if b in TZ: s.update((g, b) for g in ("DPS", "SUB") if g != b)
     return sorted(s)
 
 def tugas_semua():
