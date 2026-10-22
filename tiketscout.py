@@ -425,7 +425,7 @@ def rakit(arah, gateway, ap, penerbangan):
         tiba_lokal = tiba + dt.timedelta(hours=TZ[d])
         legs.append(dict(t="terbang", dari=o, ke=d, tgl=tgl.isoformat(), dep=c["dep"], arr=tiba_lokal.strftime("%H:%M"),
                          hari=(tiba_lokal.date() - tgl).days, menit=c["dur"], harga=c["harga"], maskapai=c["maskapai"], transit=c["transit"],
-                         sumber=c["sumber"], url=c["url"], hidden=c.get("hidden")))
+                         sumber=c["sumber"], url=c["url"], hidden=c.get("hidden"), langsung=c.get("langsung")))
         total += c["harga"]; prev_tiba = tiba
     if arah == "pulang": legs.append(darat)
     t0, t1 = utc(penerbangan[0][0], penerbangan[0][2], penerbangan[0][3]["dep"]), prev_tiba
@@ -441,13 +441,13 @@ def kartu_hidden(o, kota, d):
         for c in kartu_untuk(o, beyond, d):
             if not c.get("transit") or not re.match(r"\s*1\b", c["transit"]): continue
             if c.get("sumber") != "trip" or kota not in (c.get("via") or []): continue      # khusus Trip.com
-            leg1 = c.get("leg1")
+            leg1 = c.get("leg1"); lgs = None
             if not leg1:      # kartu ringkas tidak memuat durasi ruas pertama: ambil dari kartu o->kota yang TERBACA, penerbangan sama (jam berangkat sama, maskapai sama bila tertulis)
                 dr = [x for x in kartu_untuk(o, kota, d) if x["dep"] == c["dep"] and x.get("dur") and (not x.get("maskapai") or not c.get("maskapai") or x["maskapai"] == c["maskapai"])]
                 if not dr: continue
-                leg1 = dr[0]["dur"]
+                leg1 = dr[0]["dur"]; lgs = min(x["harga"] for x in dr)
             tiba = utc(o, d, c["dep"]) + dt.timedelta(minutes=leg1); lok = tiba + dt.timedelta(hours=TZ[kota])
-            out.append(dict(c, dur=leg1, arr=lok.strftime("%H:%M"), hidden=beyond, transit="Turun di %s (tiket s.d. %s)" % (kota, beyond)))
+            out.append(dict(c, dur=leg1, arr=lok.strftime("%H:%M"), langsung=lgs, hidden=beyond, transit="Turun di %s (tiket s.d. %s)" % (kota, beyond)))
     return sorted(out, key=lambda x: x["harga"])
 
 def semua_skenario(arah, hidden=False):
