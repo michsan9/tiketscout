@@ -455,7 +455,7 @@ def semua_skenario(arah, hidden=False):
     Simpan 2 termurah per (jalur, tanggal)."""
     hasil = []
     for gateway, ap in JALUR:
-        if hidden and not (len(ap) == 3 and ap[1] in HIDDEN): continue
+        if hidden and not (gateway == "DPS" and len(ap) == 3 and ap[1] in HIDDEN): continue        # turun-di-transit hanya untuk FULL DENPASAR (pergi dari DPS)
         seq = ap if arah == "pergi" else ap[::-1]; pasang = list(zip(seq, seq[1:]))
         for i in range((TGL_AKHIR - TGL_MULAI).days + 1):
             d1 = TGL_MULAI + dt.timedelta(days=i); cand = []
@@ -531,7 +531,7 @@ def rute_semua():
         for seq in (ap, ap[::-1]): s.update(zip(seq, seq[1:]))
     for kota, bs in HIDDEN.items():
         for b in bs:
-            if b in TZ: s.update((g, b) for g in ("DPS", "SUB") if g != b)
+            if b in TZ: s.update((g, b) for g in ("DPS",) if g != b)
     return sorted(s)
 
 def tugas_semua():
@@ -603,6 +603,14 @@ def cakupan():
     for (o, d), (ok, n, kurang) in sorted(per.items()):
         total[0] += ok; total[1] += n
         print(f"   {o}->{d}: {ok}/{n}" + (f"  kurang: {', '.join(kurang[:12])}{' ...' if len(kurang) > 12 else ''}" if kurang else "  lengkap"), flush=True)
+    if HIDDEN:
+        for kota, bs in HIDDEN.items():
+            for b in bs:
+                tg = [date for o, d, date in tugas_semua() if (o, d) == ("DPS", b)]
+                baca_ = [x for x in tg if (("DPS", b, x.isoformat()) in BARU and CARDS.get(("DPS", b, x.isoformat())))]
+                ada = [x for x in baca_ if ada_transit_kota(list(CARDS[("DPS", b, x.isoformat())].values()), b)]
+                print(f"== HIDDEN CITY DPS->{b} (turun di {kota}): {len(baca_)}/{len(tg)} tanggal terbaca, {len(ada)} tanggal punya tiket 1-transit {kota}"
+                      + (f"; belum terbaca: {', '.join(x.strftime('%d/%m') for x in tg if x not in baca_)[:200]}" if len(baca_) < len(tg) else ""), flush=True)
     status("cakupan", f"{total[0]}/{total[1]} rute-tanggal terbaca segar")
 
 def laporan_tanggal():
@@ -642,7 +650,7 @@ async def _run_once():
             ulang = [t for t in tugas if (t[0], t[1], t[2].isoformat()) not in BARU and ((t[0], t[1]) in hidup or t[2] in [x for x in per_rute[(t[0], t[1])][:3]])]
             if not ulang: break
             print(f"== PASS ULANG {putaran}: {len(ulang)} rute-tanggal belum terbaca segar, dicoba lagi", flush=True)
-            ulang.sort(key=lambda t: (0 if t[1] in ("SIN", "KUL") or t[0] in ("SIN", "KUL") else 1, t[2], t[0], t[1]))
+            ulang.sort(key=lambda t: (0 if (t[0], t[1]) in (("DPS", "SIN"), ("DPS", "KUL"), ("KUL", "PKU")) else (1 if t[1] in ("SIN", "KUL") or t[0] in ("SIN", "KUL") else 2), t[2], t[0], t[1]))      # rute hidden city (DPS->SIN, DPS->KUL, KUL->PKU) didahulukan
             await paralel(br, ulang)
         cakupan()
         simpan_cache(); laporan_tanggal()
