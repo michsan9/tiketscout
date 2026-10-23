@@ -6,7 +6,7 @@ ALUR
                                           via Surabaya : SUB->PKU, SUB->KUL, SUB->SIN
  2. Dari kota transit, cari tiket lanjutan: CGK->PKU, KUL->PKU, SIN->PKU
  3. Setelah semua data terbaca, susun BEBERAPA skenario termurah. Penerbangan lanjutan harus berangkat
-    minimal MIN_TRANSIT menit (2 jam) dan maksimal MAX_TRANSIT (12 jam) setelah penerbangan pertama mendarat (zona waktu bandara dihitung).
+    minimal MIN_TRANSIT menit (1,5 jam) dan maksimal MAX_TRANSIT (12 jam) setelah penerbangan pertama mendarat (zona waktu bandara dihitung).
  4. Travel Singaraja->Denpasar Rp145.000, bus Singaraja->Surabaya Rp250.000 (ditetapkan pengguna).
  Pergi DAN pulang dicari di setiap tanggal (default 26 Feb - 31 Maret 2027; ubah lewat variabel TGL_MULAI / TGL_AKHIR).
 
@@ -26,7 +26,7 @@ INGEST_URL = os.environ.get("INGEST_URL")          # https://domain/index.php?a=
 INGEST_KEY = os.environ.get("INGEST_KEY")
 TGL_MULAI = dt.date.fromisoformat(os.environ.get("TGL_MULAI") or "2027-02-26")     # default 26 Feb 2027; bisa diatur lewat variabel TGL_MULAI
 TGL_AKHIR = dt.date.fromisoformat(os.environ.get("TGL_AKHIR") or "2027-03-31")
-MIN_TRANSIT = 120                                  # menit antara mendarat dan penerbangan berikutnya (minimal 2 jam)
+MIN_TRANSIT = int(os.environ.get("MIN_TRANSIT") or 90)   # menit antara mendarat dan penerbangan berikutnya (minimal 1,5 jam)
 MAX_TRANSIT = int(os.environ.get("MAX_TRANSIT") or 720)   # singgah > 12 jam dianggap tidak praktis (ubah bila perlu)
 BIAYA_DARAT = {"DPS": 145_000, "SUB": 250_000}     # Singaraja -> gerbang (ditetapkan pengguna)
 DURASI_DARAT = {"DPS": 240, "SUB": 630}            # menit; PENGATURAN (bukan data OTA) - ubah sesuai pengalaman Anda
