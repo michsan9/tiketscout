@@ -592,6 +592,19 @@ async def run_once():
         status("gagal", repr(e)[:150]); raise
     status("selesai", f"{STAT['ok']} halaman terbaca, {STAT['kosong']} kosong")
 
+def cakupan():
+    """Tabel cakupan: untuk tiap rute, berapa tanggal yang terbaca SEGAR putaran ini dari seluruh tanggal yang harus dicek."""
+    per = {}
+    for o, d, date in tugas_semua():
+        e = per.setdefault((o, d), [0, 0, []]); e[1] += 1
+        if (o, d, date.isoformat()) in BARU and CARDS.get((o, d, date.isoformat())): e[0] += 1
+        else: e[2].append(date.strftime("%d/%m"))
+    print("== CAKUPAN (tanggal terbaca segar / seluruh tanggal), per rute:", flush=True); total = [0, 0]
+    for (o, d), (ok, n, kurang) in sorted(per.items()):
+        total[0] += ok; total[1] += n
+        print(f"   {o}->{d}: {ok}/{n}" + (f"  kurang: {', '.join(kurang[:12])}{' ...' if len(kurang) > 12 else ''}" if kurang else "  lengkap"), flush=True)
+    status("cakupan", f"{total[0]}/{total[1]} rute-tanggal terbaca segar")
+
 def laporan_tanggal():
     """Cetak tanggal yang belum punya data sama sekali, per rute (agar tidak ada lompatan tanggal tanpa terlihat)."""
     kosong = {}
@@ -624,6 +637,14 @@ async def _run_once():
         sisa.sort(key=lambda t: (((t[2] - TGL_MULAI).days) % 3, t[2], t[0], t[1]))     # tiga gelombang (tiap 3 hari, lalu sisanya) agar kalau terpotong tanggalnya tetap tersebar, bukan berhenti di satu tanggal
         print(f"   {sum(1 for t in sisa if (t[0], t[1], t[2].isoformat()) not in CARDS)} rute-tanggal belum punya data, {sum(1 for t in sisa if (t[0], t[1], t[2].isoformat()) in CARDS)} diperbarui dari cache", flush=True)
         await paralel(br, sisa)
+        for putaran in (1, 2):                                      # PASS ULANG: tiap rute-tanggal yang belum terbaca SEGAR putaran ini dicoba lagi (rute 'mati' di probe: 3 tanggal pertama)
+            if LEWAT[0]: break
+            ulang = [t for t in tugas if (t[0], t[1], t[2].isoformat()) not in BARU and ((t[0], t[1]) in hidup or t[2] in [x for x in per_rute[(t[0], t[1])][:3]])]
+            if not ulang: break
+            print(f"== PASS ULANG {putaran}: {len(ulang)} rute-tanggal belum terbaca segar, dicoba lagi", flush=True)
+            ulang.sort(key=lambda t: (0 if t[1] in ("SIN", "KUL") or t[0] in ("SIN", "KUL") else 1, t[2], t[0], t[1]))
+            await paralel(br, ulang)
+        cakupan()
         simpan_cache(); laporan_tanggal()
         hitung_dan_kirim()                                         # skenario sudah bisa dilihat sebelum cek silang selesai
         if K_SILANG and not LEWAT[0]:
