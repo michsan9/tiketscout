@@ -27,6 +27,7 @@ INGEST_KEY = os.environ.get("INGEST_KEY")
 TGL_MULAI = dt.date.fromisoformat(os.environ.get("TGL_MULAI") or "2027-02-26")     # default 26 Feb 2027; bisa diatur lewat variabel TGL_MULAI
 TGL_AKHIR = dt.date.fromisoformat(os.environ.get("TGL_AKHIR") or "2027-03-31")
 MIN_TRANSIT = int(os.environ.get("MIN_TRANSIT") or 90)   # menit antara mendarat dan penerbangan berikutnya (minimal 1,5 jam)
+HARI_DPS = int(os.environ.get("HARI_TRANSIT_DPS") or 3)   # PULANG ke Denpasar: singgah boleh sampai N hari (menginap) bila itu lebih murah; 0 = matikan
 MAX_TRANSIT = int(os.environ.get("MAX_TRANSIT") or 720)   # singgah > 12 jam dianggap tidak praktis (ubah bila perlu)
 BIAYA_DARAT = {"DPS": 145_000, "SUB": 250_000}     # Singaraja -> gerbang (ditetapkan pengguna)
 DURASI_DARAT = {"DPS": 240, "SUB": 630}            # menit; PENGATURAN (bukan data OTA) - ubah sesuai pengalaman Anda
@@ -464,10 +465,12 @@ def semua_skenario(arah, hidden=False):
                 if len(pasang) == 1: cand.append(rakit(arah, gateway, ap, [(o1, h1, d1, c1)])); continue
                 if not (c1["dur"] or c1["arr"]): continue
                 tiba1, (o2, h2) = tiba_utc(o1, h1, d1, c1), pasang[1]
-                for off in (0, 1):
+                panjang = (arah == "pulang" and gateway == "DPS" and HARI_DPS > 0)          # pulang ke Denpasar: singgah >1 hari dianggap bila lebih murah
+                maks = HARI_DPS * 1440 + 720 if panjang else MAX_TRANSIT
+                for off in (range(0, HARI_DPS + 2) if panjang else (0, 1)):
                     d2 = d1 + dt.timedelta(days=off)
                     for c2 in kartu_untuk(o2, h2, d2):
-                        if MIN_TRANSIT <= int((utc(o2, d2, c2["dep"]) - tiba1).total_seconds() // 60) <= MAX_TRANSIT:
+                        if MIN_TRANSIT <= int((utc(o2, d2, c2["dep"]) - tiba1).total_seconds() // 60) <= maks:
                             cand.append(rakit(arah, gateway, ap, [(o1, h1, d1, c1), (o2, h2, d2, c2)]))
             cand.sort(key=lambda r: (r["total"], r["waktu"])); hasil += cand[:2]
     if hidden:
@@ -536,7 +539,10 @@ def rute_semua():
 
 def tugas_semua():
     n = (TGL_AKHIR - TGL_MULAI).days + 1                          # leg lanjutan boleh +1 hari
-    return [(o, d, TGL_MULAI + dt.timedelta(days=i)) for i in range(n + 1) for o, d in rute_semua()]
+    out = [(o, d, TGL_MULAI + dt.timedelta(days=i)) for i in range(n + 1) for o, d in rute_semua()]
+    if HARI_DPS > 0:                                              # ruas terakhir pulang ke DPS perlu tanggal tambahan untuk singgah bermalam
+        out += [(o, d, TGL_MULAI + dt.timedelta(days=i)) for i in range(n + 1, n + 1 + HARI_DPS) for o, d in rute_semua() if d == "DPS" and o in ("CGK", "KUL", "SIN")]
+    return out
 
 STAT = dict(ok=0, kosong=0)
 LEWAT = [False]
