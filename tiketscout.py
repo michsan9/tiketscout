@@ -132,6 +132,7 @@ def maskapai(t):
 TRANSIT_DI_RE = re.compile(r"(?:transit|layover)\s+(?:di|in|at)\s+([A-Za-z][A-Za-z .'-]{2,30}?)(?=\s*\d+\s*(?:j|h|jam|hr)\b)", re.I)
 KOTA_TR = r"(?:Kuala\s*Lumpur|Jakarta|Singapura|Singapore|Surabaya|Denpasar|Bali|Bangkok|Batam|Medan|Pekanbaru|Johor\s*Bahru|Penang|Hong\s*Kong|Manila|Ho\s*Chi\s*Minh|Jeddah|Doha|Dubai)"
 LAY_DI_RE = re.compile(r"\d+\s*(?:j|h)(?:\s*\d+\s*(?:m|mnt|menit))?\s+di\s+(" + KOTA_TR + r")", re.I)      # kartu ringkas: '2j 10m di Kuala Lumpur'
+LAY_MIN_RE = re.compile(r"(\d+)\s*(?:j|h)(?:\s*(\d+)\s*(?:m|mnt|menit))?\s+di\s+" + KOTA_TR, re.I)
 LEG1_RE = re.compile(r"(?:durasi penerbangan|flight duration)\s*:?\s*(\d{1,2})\s*(?:j|h|jam|hr)s?\s*(?:(\d{1,2})\s*(?:m|mnt|menit|min)\w*)?", re.I)
 VIA_RE = {"KUL": re.compile(r"\bKUL\b|Kuala\s*Lumpur", re.I), "CGK": re.compile(r"\bCGK\b|Jakarta|Soekarno", re.I), "SIN": re.compile(r"\bSIN\b|Singapura|Singapore", re.I)}
 
@@ -157,7 +158,8 @@ def kartu(t):
     kota_tr = {re.sub(r"\s+", " ", x).strip().lower() for x in TRANSIT_DI_RE.findall(t) + LAY_DI_RE.findall(t)}      # 'Transit di Kuala Lumpur 1j 5m' (tidak ada angka 'N transit')
     tr = ("%d transit" % len(kota_tr)) if kota_tr else (sm[-1].group(0).strip().capitalize() if sm else None)
     l1 = LEG1_RE.search(t); leg1 = (int(l1.group(1)) * 60 + int(l1.group(2) or 0)) if l1 else None   # 'Durasi penerbangan: 3j 5m' pertama = ruas pertama
-    return dict(via=via, leg1=leg1, harga=min(harga), dep=jam(times[0].group(0)), arr=jam(times[1].group(0)), dur=dur, maskapai=maskapai(t),
+    ly = LAY_MIN_RE.search(t); lay = (int(ly.group(1)) * 60 + int(ly.group(2) or 0)) if ly else None      # lama singgah yang tertulis ('2j 10m di Kuala Lumpur')
+    return dict(via=via, leg1=leg1, lay=lay, harga=min(harga), dep=jam(times[0].group(0)), arr=jam(times[1].group(0)), dur=dur, maskapai=maskapai(t),
                 transit=tr, bukti=re.sub(r"\s+", " ", t).strip()[:170])
 
 def cocokkan(c, o, d):
@@ -445,8 +447,16 @@ def kartu_hidden(o, kota, d):
             leg1 = c.get("leg1"); lgs = None
             if not leg1:      # kartu ringkas tidak memuat durasi ruas pertama: ambil dari kartu o->kota yang TERBACA, penerbangan sama (jam berangkat sama, maskapai sama bila tertulis)
                 dr = [x for x in kartu_untuk(o, kota, d) if x["dep"] == c["dep"] and x.get("dur") and (not x.get("maskapai") or not c.get("maskapai") or x["maskapai"] == c["maskapai"])]
-                if not dr: continue
-                leg1 = dr[0]["dur"]; lgs = min(x["harga"] for x in dr)
+                if dr: leg1 = dr[0]["dur"]; lgs = min(x["harga"] for x in dr)
+                elif c.get("lay") and c.get("dur"):
+                    # cadangan murni dari data terbaca: total - singgah tertulis - durasi ruas kota->kota akhir (kartu kota->akhir yang TERBACA dan tiba di jam yang sama)
+                    for off in (0, 1):
+                        for x in kartu_untuk(kota, beyond, d + dt.timedelta(days=off)):
+                            if x["arr"] != c["arr"] or not x.get("dur") or (x.get("maskapai") and c.get("maskapai") and x["maskapai"] != c["maskapai"]): continue
+                            l1 = c["dur"] - c["lay"] - x["dur"]
+                            if 60 <= l1 <= 420: leg1 = l1; break
+                        if leg1: break
+                if not leg1: continue
             tiba = utc(o, d, c["dep"]) + dt.timedelta(minutes=leg1); lok = tiba + dt.timedelta(hours=TZ[kota])
             out.append(dict(c, dur=leg1, arr=lok.strftime("%H:%M"), langsung=lgs, hidden=beyond, transit="Turun di %s (tiket s.d. %s)" % (kota, beyond)))
     return sorted(out, key=lambda x: x["harga"])
@@ -535,6 +545,7 @@ def rute_semua():
     for kota, bs in HIDDEN.items():
         for b in bs:
             if b in TZ: s.update((g, b) for g in ("DPS",) if g != b)
+            if kota in TZ and b in TZ: s.add((kota, b))                  # ruas kota transit -> kota akhir tiket (dipakai menghitung jam tiba di kota transit)
     return sorted(s)
 
 def tugas_semua():
@@ -617,7 +628,23 @@ def cakupan():
                 ada = [x for x in baca_ if ada_transit_kota(list(CARDS[("DPS", b, x.isoformat())].values()), b)]
                 print(f"== HIDDEN CITY DPS->{b} (turun di {kota}): {len(baca_)}/{len(tg)} tanggal terbaca, {len(ada)} tanggal punya tiket 1-transit {kota}"
                       + (f"; belum terbaca: {', '.join(x.strftime('%d/%m') for x in tg if x not in baca_)[:200]}" if len(baca_) < len(tg) else ""), flush=True)
+    if HIDDEN: diag_hidden()
     status("cakupan", f"{total[0]}/{total[1]} rute-tanggal terbaca segar")
+
+def diag_hidden():
+    """Tiap tanggal: kenapa skema turun-di-transit ada / tidak ada (dibaca dari log)."""
+    print("== DIAGNOSA HIDDEN CITY per tanggal (kartu DPS->SIN | 1-transit via KUL | jam tiba KUL bisa dihitung | kartu KUL->PKU | skenario jadi):", flush=True)
+    n = (TGL_AKHIR - TGL_MULAI).days + 1
+    for i in range(n):
+        d = TGL_MULAI + dt.timedelta(days=i)
+        for kota, bs in HIDDEN.items():
+            for b in bs:
+                ks = kartu_untuk("DPS", b, d); tr = [c for c in ks if c.get("transit") and re.match(r"\s*1\b", c["transit"]) and kota in (c.get("via") or []) and c.get("sumber") == "trip"]
+                hid = kartu_hidden("DPS", kota, d)
+                lanj = sum(len(kartu_untuk(kota, "PKU", d + dt.timedelta(days=k))) for k in (0, 1))
+                jadi = sum(1 for r in semua_skenario("pergi", hidden=True) if r["tgl"] == d.isoformat()) if hid else 0
+                alasan = "" if jadi else (" <- tidak ada tiket SIN transit KUL (Trip.com)" if not tr else (" <- jam tiba KUL tak bisa dihitung" if not hid else (" <- tidak ada KUL->PKU yang cocok (jeda 1,5-12 jam)" if lanj == 0 or True else "")))
+                print(f"   {d:%d/%m}: {len(ks)} | {len(tr)} | {len(hid)} | {lanj} | {jadi}{alasan}", flush=True)
 
 def laporan_tanggal():
     """Cetak tanggal yang belum punya data sama sekali, per rute (agar tidak ada lompatan tanggal tanpa terlihat)."""
