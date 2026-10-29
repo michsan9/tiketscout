@@ -17,7 +17,7 @@ PAKAI
     OTA_TAMBAHAN='{"namasitus":"https://...{o}...{iso}"}'  # tambah OTA lain tanpa ubah kode (lihat isi_templat)
     python tiketscout.py login                        # PC sendiri: buka browser, selesaikan verifikasi 'saya bukan robot' SECARA MANUAL
 """
-import asyncio, json, os, random, re, sys, time, urllib.request, datetime as dt
+import asyncio, json, os, random, re, sys, time, urllib.request, urllib.error, datetime as dt
 from urllib.parse import quote
 from playwright.async_api import async_playwright
 
@@ -364,8 +364,25 @@ FEED = []
 def post(url, payload):
     if not (url and INGEST_KEY): return None
     req = urllib.request.Request(url, json.dumps(payload).encode(), {"Content-Type": "application/json"})
-    try: return urllib.request.urlopen(req, timeout=90).read()[:80]
+    try:
+        r = urllib.request.urlopen(req, timeout=90)
+        if r.geturl().split("?")[0] != url.split("?")[0]: print("  PERINGATAN: alamat dialihkan ke", r.geturl()[:120], "(POST bisa berubah jadi GET; pakai alamat akhir di INGEST_URL)", flush=True)
+        return r.read()[:80]
+    except urllib.error.HTTPError as e:
+        isi = ""
+        try: isi = e.read()[:120].decode("utf-8", "replace").replace("\n", " ")
+        except Exception: pass
+        tip = {403: "INGEST_KEY di GitHub tidak sama dengan KEY di index.php, atau diblokir firewall hosting", 404: "alamat INGEST_URL salah (cek nama file/folder)", 405: "alamat dialihkan http->https atau www: pakai alamat final persis seperti di browser", 500: "index.php error di server (cek izin tulis tiket.sqlite dan log PHP)", 401: "diblokir kunci login/hosting"}.get(e.code, "")
+        print(f"  kirim gagal: HTTP {e.code} {isi} -> {tip}", flush=True)
     except Exception as e: print("  kirim gagal:", e, flush=True)
+
+def cek_koneksi_dashboard():
+    """Uji sekali di awal: apakah dashboard menerima data dari scraper ini."""
+    if not INGEST_URL or not INGEST_KEY:
+        print("!! INGEST_URL atau INGEST_KEY belum diisi di GitHub Secrets: data TIDAK dikirim ke dashboard", flush=True); return False
+    r = post(INGEST_URL.replace("a=ingest", "a=status"), dict(key=INGEST_KEY, status="uji", info="cek koneksi"))
+    print("== KONEKSI DASHBOARD:", "OK, dashboard menerima data" if r is not None else "GAGAL (lihat alasan di atas); data tidak akan muncul sampai ini OK", flush=True)
+    return r is not None
 
 TS_KARTU, BARU, MULAI_RUN = {}, set(), [time.time()]      # TS_KARTU: (o,d,tgl) -> waktu terakhir dibaca; BARU: sudah dibaca ulang di putaran ini
 
@@ -661,6 +678,7 @@ def reset_dashboard():
         print("   dashboard dikosongkan dari data lama" if r is not None else "   (dashboard belum mendukung a=reset: perbarui index.php)", flush=True)
 
 async def _run_once():
+    cek_koneksi_dashboard()
     reset_dashboard()
     CARDS.clear(); MULAI_RUN[0] = time.time(); tugas = tugas_semua(); per_rute = {}
     print(f"cache putaran sebelumnya: {muat_cache()} rute-tanggal dipakai sebagai cadangan", flush=True)
