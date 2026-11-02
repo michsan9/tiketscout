@@ -6,7 +6,7 @@ ALUR
                                           via Surabaya : SUB->PKU, SUB->KUL, SUB->SIN
  2. Dari kota transit, cari tiket lanjutan: CGK->PKU, KUL->PKU, SIN->PKU
  3. Setelah semua data terbaca, susun BEBERAPA skenario termurah. Penerbangan lanjutan harus berangkat
-    minimal MIN_TRANSIT menit (1,5 jam) dan maksimal MAX_TRANSIT (12 jam) setelah penerbangan pertama mendarat (zona waktu bandara dihitung).
+    minimal MIN_TRANSIT menit (1,5 jam) setelah penerbangan pertama mendarat (zona waktu bandara dihitung). PERGI: tanpa batas maksimal singgah; PULANG: maksimal MAX_TRANSIT (12 jam), kecuali ruas terakhir ke Denpasar.
  4. Travel Singaraja->Denpasar Rp145.000, bus Singaraja->Surabaya Rp250.000 (ditetapkan pengguna).
  Pergi DAN pulang dicari di setiap tanggal (default 26 Feb - 31 Maret 2027; ubah lewat variabel TGL_MULAI / TGL_AKHIR).
 
@@ -35,14 +35,18 @@ NAMA = {"DPS": "Denpasar", "SUB": "Surabaya", "CGK": "Jakarta", "KUL": "Kuala Lu
 TZ = {"DPS": 8, "SUB": 7, "CGK": 7, "KUL": 8, "SIN": 8, "PKU": 7}      # selisih jam terhadap UTC (WITA/WIB/MYT/SGT)
 JALUR = [("DPS", ["DPS", "CGK", "PKU"]), ("DPS", ["DPS", "KUL", "PKU"]), ("DPS", ["DPS", "SIN", "PKU"]),
          ("SUB", ["SUB", "PKU"]),        ("SUB", ["SUB", "KUL", "PKU"]), ("SUB", ["SUB", "SIN", "PKU"])]
-if os.environ.get("DPS_PKU") == "1":               # opsional: tiket tunggal DPS->PKU (OTA memilihkan transitnya)
+if os.environ.get("DPS_PKU") != "0":               # bawaan AKTIF: tiket tunggal DPS<->PKU (langsung bila ada, atau transit pilihan OTA); isi DPS_PKU=0 untuk mematikan
     JALUR.append(("DPS", ["DPS", "PKU"]))
+if os.environ.get("SIN_KUL") != "0":               # bawaan AKTIF: dua negara transit berurutan (DPS/SUB -> SIN -> KUL -> PKU dan sebaliknya); isi SIN_KUL=0 untuk mematikan
+    for _g in ("DPS", "SUB"):
+        JALUR.append((_g, [_g, "SIN", "KUL", "PKU"])); JALUR.append((_g, [_g, "KUL", "SIN", "PKU"]))
 # "Turun di transit" (hidden city): tiket ke kota LEBIH JAUH yang transit di kota tujuan kita (mis. DPS->SIN via KUL, lebih murah dari DPS->KUL langsung).
 # Format env HIDDEN_VIA: "KUL>SIN,KUL>BKK" (transit>kota-tujuan-tiket). Kosongkan ("0") untuk mematikan. Hanya untuk tiket SEKALI JALAN penerbangan PERGI.
 HIDDEN = {}
 for _p in (os.environ.get("HIDDEN_VIA") or "KUL>SIN").split(","):
     if ">" in _p: _a, _b = _p.strip().upper().split(">", 1); HIDDEN.setdefault(_a, []).append(_b)
-FLIGHT_SITES = ["trip", "agoda", "google"]   # hanya 3 sumber yang terbaca dari server; cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
+FLIGHT_SITES = [x.strip() for x in (os.environ.get("FLIGHT_SITES") or "trip,agoda,google").split(",") if x.strip()]   # isi FLIGHT_SITES=trip,google di workflow untuk MENONAKTIFKAN Agoda bila selalu minta verifikasi anti-bot
+#   # hanya 3 sumber yang terbaca dari server; cascade OTOMATIS: sumber berikutnya dipakai bila yang sebelumnya kosong/diblokir
 LANGSUNG = set()     # tidak ada situs maskapai langsung lagi (Batik Air/Scoot/AirAsia dihapus: diblokir verifikasi)
 try:   # sumber tambahan tanpa ubah kode: {"namasitus": "https://...{o}...{iso}"}  (isi dari URL hasil pencarian di browser Anda)
     EXTRA = {k: v for k, v in json.loads(os.environ.get("OTA_TAMBAHAN") or "{}").items() if re.fullmatch(r"[a-z0-9]+", k) and str(v).startswith("https://")}
@@ -341,7 +345,7 @@ async def baca(page, site, o, d, date):
     if len(text) < 2500 and BOT_RE.search(text):
         print(f"     {site}: isi halaman: {re.sub(chr(10), ' ', text[:160])!r}", flush=True)
         print(f"     {site}: halaman VERIFIKASI ANTI-BOT -> situs dilewati 6 jam (tidak ditembus; lihat 'login' untuk verifikasi manual di PC sendiri)", flush=True)
-        JEDA[site] = time.time() + 6 * 3600
+        JEDA[site] = time.time() + 6 * 3600; print(f"     (saran: {site} sering minta verifikasi? set FLIGHT_SITES tanpa {site} di scrape.yml)", flush=True) if site == 'agoda' else None
         return None
     if not cards:
         print(f"     {site}: tidak ada kartu hasil", flush=True)
@@ -479,26 +483,37 @@ def kartu_hidden(o, kota, d):
     return sorted(out, key=lambda x: x["harga"])
 
 def semua_skenario(arah, hidden=False):
-    """Untuk tiap jalur & tanggal: gabungkan kartu; penerbangan lanjutan wajib berangkat >= MIN_TRANSIT menit setelah mendarat.
-    Simpan 2 termurah per (jalur, tanggal)."""
+    """Untuk tiap jalur & tanggal: gabungkan kartu ruas demi ruas (1-3 penerbangan); penerbangan lanjutan wajib berangkat >= MIN_TRANSIT menit setelah mendarat.
+    Tiap tahap hanya menyimpan BEAM kombinasi termurah (supaya jalur 3 ruas tetap cepat). Simpan 2 termurah per (jalur, tanggal)."""
+    BEAM = 40
     hasil = []
+    if hidden and arah != "pergi": return []                   # turun-di-transit HANYA untuk penerbangan pergi (untuk pulang lebih mahal)
     for gateway, ap in JALUR:
         if hidden and not (gateway == "DPS" and len(ap) == 3 and ap[1] in HIDDEN): continue        # turun-di-transit hanya untuk FULL DENPASAR (pergi dari DPS)
         seq = ap if arah == "pergi" else ap[::-1]; pasang = list(zip(seq, seq[1:]))
         for i in range((TGL_AKHIR - TGL_MULAI).days + 1):
-            d1 = TGL_MULAI + dt.timedelta(days=i); cand = []
-            o1, h1 = pasang[0]
+            d1 = TGL_MULAI + dt.timedelta(days=i)
+            o1, h1 = pasang[0]; sebagian = []                  # sebagian = [(daftar ruas, harga, waktu tiba UTC)]
             for c1 in (kartu_hidden(o1, h1, d1) if hidden else kartu_untuk(o1, h1, d1)):
-                if len(pasang) == 1: cand.append(rakit(arah, gateway, ap, [(o1, h1, d1, c1)])); continue
-                if not (c1["dur"] or c1["arr"]): continue
-                tiba1, (o2, h2) = tiba_utc(o1, h1, d1, c1), pasang[1]
-                panjang = (arah == "pulang" and gateway == "DPS" and HARI_DPS > 0)          # pulang ke Denpasar: singgah >1 hari dianggap bila lebih murah
-                maks = HARI_DPS * 1440 + 720 if panjang else MAX_TRANSIT
-                for off in (range(0, HARI_DPS + 2) if panjang else (0, 1)):
-                    d2 = d1 + dt.timedelta(days=off)
-                    for c2 in kartu_untuk(o2, h2, d2):
-                        if MIN_TRANSIT <= int((utc(o2, d2, c2["dep"]) - tiba1).total_seconds() // 60) <= maks:
-                            cand.append(rakit(arah, gateway, ap, [(o1, h1, d1, c1), (o2, h2, d2, c2)]))
+                if len(pasang) > 1 and not (c1["dur"] or c1["arr"]): continue
+                sebagian.append(([(o1, h1, d1, c1)], c1["harga"], tiba_utc(o1, h1, d1, c1)))
+            sebagian.sort(key=lambda x: x[1]); sebagian = sebagian[:BEAM]
+            for k in range(1, len(pasang)):
+                o2, h2 = pasang[k]; terakhir = (k == len(pasang) - 1)
+                panjang = (arah == "pulang" and gateway == "DPS" and HARI_DPS > 0 and terakhir)          # pulang ke Denpasar: singgah >1 hari dianggap bila lebih murah
+                maks = HARI_DPS * 1440 + 720 if panjang else (10 ** 7 if arah == "pergi" else MAX_TRANSIT); baru = []      # PERGI: tanpa batas maksimal singgah
+
+                for legs, harga, tiba in sebagian:
+                    dprev = legs[-1][2]
+                    for off in (range(0, HARI_DPS + 2) if panjang else (0, 1)):
+                        d2 = dprev + dt.timedelta(days=off)
+                        if d2 > TGL_AKHIR: continue                      # tidak ada tanggal setelah TGL_AKHIR (mis. 1-3 April)
+                        for c2 in kartu_untuk(o2, h2, d2):
+                            if not MIN_TRANSIT <= int((utc(o2, d2, c2["dep"]) - tiba).total_seconds() // 60) <= maks: continue
+                            if not terakhir and not (c2["dur"] or c2["arr"]): continue
+                            baru.append((legs + [(o2, h2, d2, c2)], harga + c2["harga"], tiba_utc(o2, h2, d2, c2)))
+                baru.sort(key=lambda x: x[1]); sebagian = baru[:BEAM]
+            cand = [rakit(arah, gateway, ap, legs) for legs, _, _ in sebagian]
             cand.sort(key=lambda r: (r["total"], r["waktu"])); hasil += cand[:2]
     if hidden:
         for r in hasil: r["arah"] = "turun"
@@ -566,11 +581,8 @@ def rute_semua():
     return sorted(s)
 
 def tugas_semua():
-    n = (TGL_AKHIR - TGL_MULAI).days + 1                          # leg lanjutan boleh +1 hari
-    out = [(o, d, TGL_MULAI + dt.timedelta(days=i)) for i in range(n + 1) for o, d in rute_semua()]
-    if HARI_DPS > 0:                                              # ruas terakhir pulang ke DPS perlu tanggal tambahan untuk singgah bermalam
-        out += [(o, d, TGL_MULAI + dt.timedelta(days=i)) for i in range(n + 1, n + 1 + HARI_DPS) for o, d in rute_semua() if d == "DPS" and o in ("CGK", "KUL", "SIN")]
-    return out
+    n = (TGL_AKHIR - TGL_MULAI).days + 1
+    return [(o, d, TGL_MULAI + dt.timedelta(days=i)) for i in range(n) for o, d in rute_semua()]          # hanya TGL_MULAI..TGL_AKHIR (tidak ada 1-3 April)
 
 STAT = dict(ok=0, kosong=0)
 LEWAT = [False]
