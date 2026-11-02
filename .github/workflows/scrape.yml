@@ -2,7 +2,8 @@
 name: scrape-tiket
 on:
   schedule:
-    - cron: '0 */3 * * *'          # tiap 3 jam (waktu UTC)
+    # Jadwal dalam WITA (UTC+8): 00:00, 03:00, 06:00, 09:00, 12:00, 16:00, 19:00, 22:00. GitHub memakai UTC, jadi ditulis -8 jam:
+    - cron: '0 16,19,22,1,4,8,11,14 * * *'     # = 00,03,06,09,12,16,19,22 WITA (GitHub bisa terlambat beberapa menit)
   workflow_dispatch:
     inputs:
       cek:
@@ -34,6 +35,7 @@ jobs:
           SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 200), lalu hasil dihitung & dikirim sebelum job 240 menit
           OTA_TAMBAHAN: ${{ vars.OTA_TAMBAHAN }}   # opsional: OTA lain, JSON mis. {"namasitus":"https://...{o}...{iso}"} (lihat isi_templat di tiketscout.py)
           OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
+          FLIGHT_SITES: ${{ vars.FLIGHT_SITES }}   # opsional: daftar sumber, mis. trip,google (tanpa agoda bila selalu minta verifikasi anti-bot); kosong = trip,agoda,google
           DPS_PKU: ${{ vars.DPS_PKU }}             # opsional: 1 = tambahkan tiket tunggal DPS->PKU (transit dipilihkan OTA)
           KURS_MYR_IDR: ${{ vars.KURS_MYR_IDR }}   # opsional: kurs MYR->IDR buatan Anda sendiri (bila situs maskapai tampil ringgit)
           KURS_SGD_IDR: ${{ vars.KURS_SGD_IDR }}   # opsional: kurs SGD->IDR buatan Anda sendiri
