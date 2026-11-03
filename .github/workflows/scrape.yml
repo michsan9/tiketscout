@@ -2,8 +2,10 @@
 name: scrape-tiket
 on:
   schedule:
-    # Jadwal dalam WITA (UTC+8): 00:00, 03:00, 06:00, 09:00, 12:00, 16:00, 19:00, 22:00. GitHub memakai UTC, jadi ditulis -8 jam:
-    - cron: '0 16,19,22,1,4,8,11,14 * * *'     # = 00,03,06,09,12,16,19,22 WITA (GitHub bisa terlambat beberapa menit)
+    # Target hasil segar (WITA, UTC+8): 00:00, 03:00, 06:00, 09:00, 12:00, 16:00, 19:00, 22:00. GitHub memakai UTC, jadi ditulis -8 jam:
+    - cron: '47 15,18,21,0,3,7,10,13 * * *'     # dimulai :47 SEBELUM jam target (= 23:47 WITA utk 00:00, dst) karena GitHub biasanya telat 5-20 mnt & menit :00 paling padat
+    # CADANGAN: GitHub kadang menghilangkan satu pemicu jadwal begitu saja. Pemicu kedua 30 menit kemudian; bila run utama sudah jalan, langkah 'Cek duplikat' membuatnya berhenti sendiri.
+    - cron: '17 16,19,22,1,4,8,11,14 * * *'
   workflow_dispatch:
     inputs:
       cek:
@@ -19,20 +21,36 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 150
     steps:
+      - name: Cek duplikat (lewati bila run lain sudah jalan/sukses dalam 75 menit terakhir)
+        id: guard
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          batas=$(date -u -d '75 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+          n=$(gh api "repos/${{ github.repository }}/actions/workflows/scrape.yml/runs?per_page=20" \
+            --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.created_at > \"$batas\") | select(.status != \"completed\" or .conclusion == \"success\")] | length")
+          echo "run lain dalam 75 menit: $n"
+          if [ "${n:-0}" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with: { python-version: '3.12' }
-      - run: pip install playwright && playwright install --with-deps chromium
+      - if: steps.guard.outputs.skip != 'true'
+        run: pip install playwright && playwright install --with-deps chromium
       - name: Scraping
+        if: steps.guard.outputs.skip != 'true'
         env:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_KEY: ${{ secrets.INGEST_KEY }}
           CEK: ${{ github.event.inputs.cek }}
           TGL_MULAI: ${{ vars.TGL_MULAI }}         # opsional; kosong = 2027-02-26. Bila Anda pernah mengisi variabel ini, hapus atau ganti ke 2027-02-26
           TGL_AKHIR: ${{ vars.TGL_AKHIR }}         # opsional; kosong = 2027-03-31
-          SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 200), lalu hasil dihitung & dikirim sebelum job 240 menit
+          SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 100), lalu hasil dihitung & dikirim; harus < jarak jadwal terdekat (2 jam)
           OTA_TAMBAHAN: ${{ vars.OTA_TAMBAHAN }}   # opsional: OTA lain, JSON mis. {"namasitus":"https://...{o}...{iso}"} (lihat isi_templat di tiketscout.py)
           OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
           FLIGHT_SITES: ${{ vars.FLIGHT_SITES }}   # opsional: daftar sumber, mis. trip,google (tanpa agoda bila selalu minta verifikasi anti-bot); kosong = trip,agoda,google
