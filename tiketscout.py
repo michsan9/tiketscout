@@ -56,7 +56,7 @@ FLIGHT_SITES += [k for k in EXTRA if k not in FLIGHT_SITES]
 NOROUTE = {}     # (situs, asal, tujuan) -> berapa kali kosong; situs maskapai dilewati setelah 2x kosong (maskapai itu tidak terbang di rute tsb)
 OTA_SEMUA = os.environ.get("OTA_SEMUA") == "1"             # 1 = baca SEMUA OTA untuk tiap rute-tanggal lalu gabungkan (lebih lama)
 WORKERS = int(os.environ.get("WORKERS") or 6)
-SOFT_MENIT = int(os.environ.get("SOFT_MENIT") or 200)          # setelah N menit pencarian dihentikan rapi, lalu skenario dihitung & dikirim (batas job GitHub 240 menit)
+SOFT_MENIT = int(os.environ.get("SOFT_MENIT") or 45)          # setelah N menit pencarian dihentikan rapi, lalu skenario dihitung & dikirim (job GitHub 150 menit)
 CACHE_FILE = os.environ.get("CACHE_FILE") or "kartu_cache.json"   # hasil putaran sebelumnya: tanggal yang belum sempat dibaca tidak hilang
 CACHE_JAM = float(os.environ.get("CACHE_JAM") or 0)          # 0 = TIDAK memakai data lama sama sekali (bawaan). Isi jam bila ingin cadangan dari putaran sebelumnya
 K_SILANG = int(os.environ.get("K_SILANG") or 3)            # cek silang: K tanggal termurah per rute dibaca juga di sumber LAIN (0 = matikan)              # halaman browser paralel
