@@ -684,14 +684,10 @@ def laporan_tanggal():
     for (o, d), lst in sorted(kosong.items()): print(f"   belum ada data {o}->{d}: {', '.join(lst)}", flush=True)
 
 def reset_dashboard():
-    """Awal putaran: data lama TIDAK dihapus (dashboard tetap terisi & terus diperbarui langsung). Yang lama dibuang di akhir putaran lewat bersihkan_lama()."""
-    print("   data lama dibiarkan tampil; yang tidak terbaca ulang dibuang di akhir putaran", flush=True)
-
-def bersihkan_lama():
-    """Akhir putaran: hapus harga yang lebih tua dari awal putaran ini (hanya data segar yang tersisa)."""
+    """Awal putaran: kosongkan harga & skenario lama supaya dashboard hanya menampilkan data putaran ini (riwayat untuk grafik tren TIDAK dihapus)."""
     if INGEST_URL and INGEST_KEY:
-        r = post(INGEST_URL.replace("a=ingest", "a=reset"), dict(key=INGEST_KEY, before=int(MULAI_RUN[0])))
-        print("   data lama dibuang" if r is not None else "   (dashboard belum mendukung: perbarui index.php)", flush=True)
+        r = post(INGEST_URL.replace("a=ingest", "a=reset"), dict(key=INGEST_KEY))
+        print("   dashboard dikosongkan dari data lama (riwayat grafik tetap)" if r is not None else "   (dashboard belum mendukung a=reset: perbarui index.php)", flush=True)
 
 async def _run_once():
     cek_koneksi_dashboard()
@@ -726,7 +722,7 @@ async def _run_once():
             ts = daftar_silang(); print(f"== CEK SILANG: {len(ts)} halaman (sumber lain untuk {K_SILANG} tanggal termurah per rute)", flush=True)
             await paralel(br, ts, proses_silang)
         await br.close()
-    simpan_cache(); hitung_dan_kirim(tampil=True); bersihkan_lama()
+    simpan_cache(); hitung_dan_kirim(tampil=True)
     if INGEST_URL: print("  notifikasi email:", post(INGEST_URL.replace("a=ingest", "a=notif"), dict(key=INGEST_KEY)), flush=True)      # dashboard memutuskan sendiri apakah ada tiket 3-4 juta yang perlu dikabarkan
     print("== SELESAI.", STAT, flush=True)
 
