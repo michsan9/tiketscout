@@ -55,8 +55,8 @@ except Exception as e:
 FLIGHT_SITES += [k for k in EXTRA if k not in FLIGHT_SITES]
 NOROUTE = {}     # (situs, asal, tujuan) -> berapa kali kosong; situs maskapai dilewati setelah 2x kosong (maskapai itu tidak terbang di rute tsb)
 OTA_SEMUA = os.environ.get("OTA_SEMUA") == "1"             # 1 = baca SEMUA OTA untuk tiap rute-tanggal lalu gabungkan (lebih lama)
-WORKERS = int(os.environ.get("WORKERS") or 6)
-SOFT_MENIT = int(os.environ.get("SOFT_MENIT") or 45)          # setelah N menit pencarian dihentikan rapi, lalu skenario dihitung & dikirim (job GitHub 150 menit)
+WORKERS = int(os.environ.get("WORKERS") or 12)
+SOFT_MENIT = int(os.environ.get("SOFT_MENIT") or 270)          # setelah N menit pencarian dihentikan rapi, lalu skenario dihitung & dikirim (job GitHub 360 menit; praktis tanpa batas)
 CACHE_FILE = os.environ.get("CACHE_FILE") or "kartu_cache.json"   # hasil putaran sebelumnya: tanggal yang belum sempat dibaca tidak hilang
 CACHE_JAM = float(os.environ.get("CACHE_JAM") or 0)          # 0 = TIDAK memakai data lama sama sekali (bawaan). Isi jam bila ingin cadangan dari putaran sebelumnya
 K_SILANG = int(os.environ.get("K_SILANG") or 3)            # cek silang: K tanggal termurah per rute dibaca juga di sumber LAIN (0 = matikan)              # halaman browser paralel
@@ -627,7 +627,7 @@ async def paralel(br, tugas, fn=None):
                 break
             try: t = q.get_nowait()
             except asyncio.QueueEmpty: break
-            await (fn or proses)(page, t); await asyncio.sleep(random.uniform(1.5, 4))
+            await (fn or proses)(page, t); await asyncio.sleep(random.uniform(0.8, 2.2))
         await ctx.close()
     await asyncio.gather(*[kerja() for _ in range(max(1, WORKERS))])
 
