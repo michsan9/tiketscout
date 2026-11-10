@@ -605,7 +605,7 @@ async def proses(page, t):
                 print(f"    [hidden-diag] {o}->{d} {ds}: {len(s1)} kartu 1-transit, kota transit tertulis: {sum(1 for x in s1 if x.get('via') and any(v not in (d,) for v in x['via']))}"
                       + (f" | contoh: {min(s1, key=lambda x: x['harga'])['bukti'][:150]}" if s1 else ""), flush=True)
             if STAT["ok"] % 40 == 0: status("progres", f"{STAT['ok']} halaman terbaca")
-            if STAT["ok"] % 80 == 0: simpan_cache(); hitung_dan_kirim()               # dashboard ikut terisi selama proses berjalan
+            if STAT["ok"] % 25 == 0: simpan_cache(); hitung_dan_kirim()               # dashboard ikut terisi selama proses berjalan
             if not OTA_SEMUA: return True
             continue
         if site in LANGSUNG and time.time() >= JEDA.get(site, 0): NOROUTE[(site, o, d)] = NOROUTE.get((site, o, d), 0) + 1; continue      # kosong biasa (maskapai tak terbang di rute ini)
@@ -684,10 +684,14 @@ def laporan_tanggal():
     for (o, d), lst in sorted(kosong.items()): print(f"   belum ada data {o}->{d}: {', '.join(lst)}", flush=True)
 
 def reset_dashboard():
-    """Hapus data lama di dashboard supaya yang tampil hanya hasil putaran ini."""
+    """Awal putaran: data lama TIDAK dihapus (dashboard tetap terisi & terus diperbarui langsung). Yang lama dibuang di akhir putaran lewat bersihkan_lama()."""
+    print("   data lama dibiarkan tampil; yang tidak terbaca ulang dibuang di akhir putaran", flush=True)
+
+def bersihkan_lama():
+    """Akhir putaran: hapus harga yang lebih tua dari awal putaran ini (hanya data segar yang tersisa)."""
     if INGEST_URL and INGEST_KEY:
-        r = post(INGEST_URL.replace("a=ingest", "a=reset"), dict(key=INGEST_KEY))
-        print("   dashboard dikosongkan dari data lama" if r is not None else "   (dashboard belum mendukung a=reset: perbarui index.php)", flush=True)
+        r = post(INGEST_URL.replace("a=ingest", "a=reset"), dict(key=INGEST_KEY, before=int(MULAI_RUN[0])))
+        print("   data lama dibuang" if r is not None else "   (dashboard belum mendukung: perbarui index.php)", flush=True)
 
 async def _run_once():
     cek_koneksi_dashboard()
@@ -722,7 +726,7 @@ async def _run_once():
             ts = daftar_silang(); print(f"== CEK SILANG: {len(ts)} halaman (sumber lain untuk {K_SILANG} tanggal termurah per rute)", flush=True)
             await paralel(br, ts, proses_silang)
         await br.close()
-    simpan_cache(); hitung_dan_kirim(tampil=True)
+    simpan_cache(); hitung_dan_kirim(tampil=True); bersihkan_lama()
     if INGEST_URL: print("  notifikasi email:", post(INGEST_URL.replace("a=ingest", "a=notif"), dict(key=INGEST_KEY)), flush=True)      # dashboard memutuskan sendiri apakah ada tiket 3-4 juta yang perlu dikabarkan
     print("== SELESAI.", STAT, flush=True)
 
