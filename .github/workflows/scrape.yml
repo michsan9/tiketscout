@@ -4,7 +4,7 @@ on:
   schedule:
     # Target hasil segar (WITA, UTC+8): 00:00, 03:00, 06:00, 09:00, 12:00, 16:00, 19:00, 22:00. GitHub memakai UTC, jadi ditulis -8 jam:
     - cron: '47 15,18,21,0,3,7,10,13 * * *'     # dimulai :47 SEBELUM jam target (= 23:47 WITA utk 00:00, dst) karena GitHub biasanya telat 5-20 mnt & menit :00 paling padat
-    # CADANGAN: GitHub kadang menghilangkan satu pemicu jadwal begitu saja. Pemicu kedua 30 menit kemudian; bila run utama sudah jalan, langkah 'Cek duplikat' membuatnya berhenti sendiri.
+    # CADANGAN: GitHub kadang menghilangkan satu pemicu jadwal begitu saja. Pemicu kedua 30 menit kemudian; bila ada run aktif atau run sukses selesai <60 menit lalu, langkah 'Cek jarak' membatalkannya sendiri.
     - cron: '17 16,19,22,1,4,8,11,14 * * *'
   workflow_dispatch:
     inputs:
@@ -23,18 +23,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - name: Cek duplikat (lewati bila run lain sudah jalan/sukses dalam 75 menit terakhir)
+      - name: Cek jarak antar-run (jalan hanya bila tidak ada run aktif dan run sukses terakhir selesai >= 60 menit lalu)
         id: guard
         if: github.event_name == 'schedule'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          JARAK_MENIT: ${{ vars.JARAK_MENIT || '60' }}
         run: |
-          batas=$(date -u -d '75 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
-          n=$(gh api "repos/${{ github.repository }}/actions/workflows/scrape.yml/runs?per_page=20" \
-            --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.created_at > \"$batas\") | select(.status != \"completed\" or .conclusion == \"success\")] | length")
-          echo "run lain dalam 75 menit: $n"
-          if [ "${n:-0}" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+          batas=$(date -u -d "$JARAK_MENIT minutes ago" +%Y-%m-%dT%H:%M:%SZ)
+          n=$(gh api "repos/${{ github.repository }}/actions/workflows/scrape.yml/runs?per_page=30" \
+            --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status == \"in_progress\" or (.status == \"completed\" and .conclusion == \"success\" and .updated_at > \"$batas\"))] | length")
+          echo "run aktif / selesai dalam $JARAK_MENIT menit terakhir: $n"
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Dilewati: jarak antar-run belum $JARAK_MENIT menit. Run ini dibatalkan otomatis."
+            gh run cancel ${{ github.run_id }} --repo ${{ github.repository }} || true
+            sleep 20
+          fi
       - uses: actions/checkout@v4
         if: steps.guard.outputs.skip != 'true'
       - uses: actions/setup-python@v5
@@ -50,7 +56,7 @@ jobs:
           CEK: ${{ github.event.inputs.cek }}
           TGL_MULAI: ${{ vars.TGL_MULAI }}         # opsional; kosong = 2027-02-26. Bila Anda pernah mengisi variabel ini, hapus atau ganti ke 2027-02-26
           TGL_AKHIR: ${{ vars.TGL_AKHIR }}         # opsional; kosong = 2027-03-31
-          SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 100), lalu hasil dihitung & dikirim; harus < jarak jadwal terdekat (2 jam)
+          SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 45), lalu hasil dihitung & dikirim; agar run selesai <1 jam sebelum jadwal berikutnya (jarak terdekat 2 jam, jeda wajib 60 mnt)
           OTA_TAMBAHAN: ${{ vars.OTA_TAMBAHAN }}   # opsional: OTA lain, JSON mis. {"namasitus":"https://...{o}...{iso}"} (lihat isi_templat di tiketscout.py)
           OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
           FLIGHT_SITES: ${{ vars.FLIGHT_SITES }}   # opsional: daftar sumber, mis. trip,google (tanpa agoda bila selalu minta verifikasi anti-bot); kosong = trip,agoda,google
