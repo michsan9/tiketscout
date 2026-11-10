@@ -21,9 +21,9 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 360
     steps:
-      - name: Cek jarak antar-run (jalan hanya bila tidak ada run aktif dan run sukses terakhir selesai >= 60 menit lalu)
+      - name: Jeda antar-run (minimal 60 menit sejak run sebelumnya SELESAI)
         id: guard
         if: github.event_name == 'schedule'
         continue-on-error: true
@@ -31,15 +31,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           JARAK_MENIT: ${{ vars.JARAK_MENIT || '60' }}
         run: |
-          batas=$(date -u -d "$JARAK_MENIT minutes ago" +%Y-%m-%dT%H:%M:%SZ)
-          n=$(gh api "repos/${{ github.repository }}/actions/workflows/scrape.yml/runs?per_page=30" \
-            --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status == \"in_progress\" or (.status == \"completed\" and .conclusion == \"success\" and .updated_at > \"$batas\"))] | length")
-          echo "run aktif / selesai dalam $JARAK_MENIT menit terakhir: $n"
-          if [ "${n:-0}" -gt 0 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Dilewati: jarak antar-run belum $JARAK_MENIT menit. Run ini dibatalkan otomatis."
-            gh run cancel ${{ github.run_id }} --repo ${{ github.repository }} || true
-            sleep 20
+          R="repos/${{ github.repository }}/actions"
+          mulai=$(date -u -d "$(gh api $R/runs/${{ github.run_id }} --jq .created_at)" +%s)
+          # run lain yang masih aktif -> run ini duplikat, batalkan
+          aktif=$(gh api "$R/workflows/scrape.yml/runs?per_page=30" --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status == \"in_progress\")] | length")
+          # waktu selesai run sukses terakhir (epoch)
+          akhir=$(gh api "$R/workflows/scrape.yml/runs?per_page=30" --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.status == \"completed\" and .conclusion == \"success\") | .updated_at] | sort | last // empty")
+          akhir=$( [ -n "$akhir" ] && date -u -d "$akhir" +%s || echo 0 )
+          now=$(date -u +%s); tunggu=$(( akhir + JARAK_MENIT*60 - now ))
+          echo "aktif=$aktif, run terakhir selesai $(( (now-akhir)/60 )) menit lalu, perlu tunggu ${tunggu}s"
+          if [ "${aktif:-0}" -gt 0 ]; then batal=1
+          elif [ "$tunggu" -gt 0 ] && [ "$akhir" -ge "$mulai" ]; then batal=1     # run sebelumnya selesai SETELAH run ini dipicu = pemicu ganda dari jadwal yang sama
+          else batal=0; fi
+          if [ "$batal" = 1 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "Dilewati (duplikat). Run dibatalkan."
+            gh run cancel ${{ github.run_id }} --repo ${{ github.repository }} || true; sleep 20
+          elif [ "$tunggu" -gt 0 ]; then
+            echo "Menunggu ${tunggu}s agar jeda $JARAK_MENIT menit terpenuhi, lalu jalan."; sleep "$tunggu"
           fi
       - uses: actions/checkout@v4
         if: steps.guard.outputs.skip != 'true'
@@ -56,7 +64,8 @@ jobs:
           CEK: ${{ github.event.inputs.cek }}
           TGL_MULAI: ${{ vars.TGL_MULAI }}         # opsional; kosong = 2027-02-26. Bila Anda pernah mengisi variabel ini, hapus atau ganti ke 2027-02-26
           TGL_AKHIR: ${{ vars.TGL_AKHIR }}         # opsional; kosong = 2027-03-31
-          SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 45), lalu hasil dihitung & dikirim; agar run selesai <1 jam sebelum jadwal berikutnya (jarak terdekat 2 jam, jeda wajib 60 mnt)
+          WORKERS: ${{ vars.WORKERS }}             # opsional: jumlah halaman dibaca bersamaan (default 12; turunkan ke 8 bila runner kehabisan memori)
+          SOFT_MENIT: ${{ vars.SOFT_MENIT }}       # opsional: batas lunak pencarian (menit, default 270 = praktis tanpa batas), lalu hasil dihitung & dikirim; dibatasi hanya agar tidak melewati batas job 360 menit
           OTA_TAMBAHAN: ${{ vars.OTA_TAMBAHAN }}   # opsional: OTA lain, JSON mis. {"namasitus":"https://...{o}...{iso}"} (lihat isi_templat di tiketscout.py)
           OTA_SEMUA: ${{ vars.OTA_SEMUA }}         # opsional: 1 = baca SEMUA OTA per rute-tanggal (lebih lama)
           FLIGHT_SITES: ${{ vars.FLIGHT_SITES }}   # opsional: daftar sumber, mis. trip,google (tanpa agoda bila selalu minta verifikasi anti-bot); kosong = trip,agoda,google
